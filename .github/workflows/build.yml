@@ -25,7 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: gateway
-      - name: Build smg (ci profile: thin LTO, fast)
+      - name: "Build smg (ci profile: thin LTO, fast)"
         run: cargo build --profile ci --bin smg
         working-directory: gateway
       - uses: actions/upload-artifact@v4
