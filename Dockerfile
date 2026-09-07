@@ -10,5 +10,8 @@ COPY ${BIN} /usr/local/bin/smg
 RUN chmod +x /usr/local/bin/smg
 EXPOSE 8801 29001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s CMD curl -sf http://127.0.0.1:${ROUTER_PORT:-8801}/health || exit 1
-ENTRYPOINT ["smg", "launch"]
-CMD ["--host", "0.0.0.0", "--port", "8801", "--backend", "sglang", "--policy", "cache_aware"]
+# ENTRYPOINT just resolves the binary; CMD carries the subcommand plus sane defaults.
+# This avoids the historical `smg launch launch ...` failure mode where the subcommand
+# appeared in both ENTRYPOINT and CMD and clap rejected the duplicate positional arg.
+ENTRYPOINT ["smg"]
+CMD ["launch", "--host", "0.0.0.0", "--port", "8801", "--backend", "sglang", "--policy", "cache_aware"]
