@@ -7,7 +7,8 @@
 #   4. copies it over gateway/, reapplying the local patches: rust-only workspace,
 #      harmony as a path dep, and the [profile.ci] build profile
 #   5. verifies with cargo build --profile ci --bin smg (SKIP_BUILD=1 to skip)
-#   6. commits, tags upstream-<date>-<ref>, pushes -> triggers build-and-publish (ghcr)
+#   6. commits, tags upstream-<date>-<ref>, pushes; the publish job in
+#      .github/workflows/upstream-sync.yml then ships the ghcr image from this same binary
 #
 # Local dry run: SKIP_BUILD=1 SKIP_PUSH=1 bash watcher/upstream_sync.sh
 # CI:            bash watcher/upstream_sync.sh   (UPSTREAM_REF optional)
@@ -111,7 +112,7 @@ if [ "$SKIP_PUSH" != "1" ]; then
   git -C "$ROOT" push origin "HEAD:$BRANCH"
   git -C "$ROOT" tag -f "$TAG"
   git -C "$ROOT" push origin "$TAG"
-  log "pushed $BRANCH + tag $TAG; build-and-publish will build and push the ghcr image"
+  log "pushed $BRANCH + tag $TAG; the publish job ships the ghcr image from the staged binary"
 else
   log "SKIP_PUSH=1; commit left on $BRANCH (would tag $TAG)"
 fi

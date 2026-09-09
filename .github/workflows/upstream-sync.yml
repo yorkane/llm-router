@@ -1,9 +1,19 @@
 # Weekly sync of the vendored sgl-model-gateway from sgl-project/sglang.
-# The sync job verifies the rust build, commits to main and pushes a tag; that
-# push triggers build-and-publish, which builds the smg binary and publishes
-# the ghcr.io/yorkane/llm-router image. If a future upstream breaks the build,
-# the workflow fails before the push and the ghcr image stays on the last good
-# version; re-run with a forced ref to pin the sync to a known-good tag.
+#
+# One workflow does the whole round-trip, so a pure cron sync also ships the
+# ghcr image - no PAT, no second cold cargo build:
+#
+#   sync    - sparse-clone the newest upstream tag, reapply local patches,
+#             cargo build --profile ci (verification + produces the binary),
+#             commit to main, tag upstream-<date>-<ref>, push.
+#   publish - only when sync produced a new commit (upstream actually moved);
+#             builds the docker image from that same binary and pushes it to
+#             ghcr.io/yorkane/llm-router (latest + sha).
+#
+# If a future upstream breaks the build, sync fails before the push and the ghcr
+# image stays on the last good version; re-run with a forced ref to pin the sync
+# to a known-good tag. The git push uses GITHUB_TOKEN, which GitHub does not
+# re-trigger on, so no PAT is needed and build-and-publish is not fired twice.
 name: upstream-sync
 on:
   schedule:
@@ -17,10 +27,17 @@ on:
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: yorkane/llm-router
 
 jobs:
   sync:
     runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.stage.outputs.changed }}
     env:
       UPSTREAM_REF: ${{ github.event.inputs.ref }}
     steps:
@@ -31,5 +48,54 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: gateway
-      - name: Sync sgl-model-gateway from upstream
+      - name: Sync sgl-model-gateway from upstream (sync + build + commit + push)
         run: bash watcher/upstream_sync.sh
+      - name: Stage binary + record whether upstream moved
+        id: stage
+        run: |
+          if [ "$(git rev-parse HEAD)" != "${{ github.sha }}" ] && [ -f gateway/target/ci/smg ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "upstream moved; binary staged at gateway/target/ci/smg"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "already up to date; no image to publish"
+          fi
+      - name: Upload smg binary
+        if: steps.stage.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smg
+          path: gateway/target/ci/smg
+
+  publish:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: smg
+          path: artifact
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: BIN=artifact/smg
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
