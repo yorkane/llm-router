@@ -1,0 +1,35 @@
+# Weekly sync of the vendored sgl-model-gateway from sgl-project/sglang.
+# The sync job verifies the rust build, commits to main and pushes a tag; that
+# push triggers build-and-publish, which builds the smg binary and publishes
+# the ghcr.io/yorkane/llm-router image. If a future upstream breaks the build,
+# the workflow fails before the push and the ghcr image stays on the last good
+# version; re-run with a forced ref to pin the sync to a known-good tag.
+name: upstream-sync
+on:
+  schedule:
+    - cron: '0 9 * * 1' # Mondays 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream tag to force (default: newest v0.x.y above current)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    env:
+      UPSTREAM_REF: ${{ github.event.inputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev cmake pkg-config protobuf-compiler libprotobuf-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway
+      - name: Sync sgl-model-gateway from upstream
+        run: bash watcher/upstream_sync.sh
