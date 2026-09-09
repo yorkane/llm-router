@@ -8285,9 +8285,9 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wfaas"
-version = "1.0.0"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234f34ac6890ad4fd2b93c6ecf9e5e6bfddbb0e574f453f3d6c601530505f25a"
+checksum = "73c07fa5d59193a83b48bbafaf53a99bffc70872af47671ddb6392f531013196"
 dependencies = [
  "async-trait",
  "backoff",
