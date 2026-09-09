@@ -2,7 +2,8 @@
 # watcher/upstream_sync.sh — sync the vendored sgl-model-gateway from upstream.
 #
 #   1. reads the last synced upstream tag from gateway/.upstream-ref
-#   2. picks the newest upstream v0.x.y tag strictly newer (or UPSTREAM_REF forces one)
+#   2. jumps to the newest upstream v0.x.y tag (or UPSTREAM_REF forces one);
+#      does nothing when already at the newest
 #   3. sparse-clones only sgl-model-gateway at that tag
 #   4. copies it over gateway/, reapplying the local patches: rust-only workspace,
 #      harmony as a path dep, and the [profile.ci] build profile
@@ -30,7 +31,7 @@ log "last synced upstream tag: $CURRENT_TAG"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# --- pick the target tag ---
+# --- pick the target tag: jump straight to the newest v0.x.y ---
 if [ -n "${UPSTREAM_REF:-}" ]; then
   TARGET_REF="$UPSTREAM_REF"
   log "forced target: $TARGET_REF"
@@ -38,13 +39,19 @@ else
   git ls-remote --tags "$UPSTREAM_REPO" 'v0.*' 2>/dev/null |
     sed 's#.*refs/tags/##' | grep -v '\^{}$' | sort -V > "$WORK/tags"
   [ -s "$WORK/tags" ] || { echo "could not list upstream tags" >&2; exit 1; }
-  { cat "$WORK/tags"; echo "$CURRENT_TAG"; } | sort -V > "$WORK/all"
-  TARGET_REF="$(grep -A1 -xF "$CURRENT_TAG" "$WORK/all" | tail -n1)"
-  if [ -z "$TARGET_REF" ]; then
-    log "no upstream tag newer than $CURRENT_TAG; nothing to do"
+  TARGET_REF="$(tail -n1 "$WORK/tags")"
+  if [ "$TARGET_REF" = "$CURRENT_TAG" ]; then
+    log "already up to date with upstream $CURRENT_TAG; nothing to do"
     exit 0
   fi
-  log "target tag: $TARGET_REF"
+  # guard: the newest tag must really sort above the current one, otherwise the
+  # current tag was deleted/renamed upstream and we should not step backwards
+  NEWEST="$(printf '%s\n%s' "$CURRENT_TAG" "$TARGET_REF" | sort -V | tail -n1)"
+  if [ "$NEWEST" != "$TARGET_REF" ]; then
+    log "upstream newest ($TARGET_REF) is not newer than current ($CURRENT_TAG); nothing to do"
+    exit 0
+  fi
+  log "target tag: $TARGET_REF (jumping from $CURRENT_TAG)"
 fi
 
 # --- sparse clone of just the gateway directory at that tag ---
@@ -99,7 +106,7 @@ if git -C "$ROOT" diff --quiet -- gateway; then
   exit 0
 fi
 
-# --- commit, tag, push (the push triggers build-and-publish -> ghcr image) ---
+# --- commit, tag, push; the publish job then ships the ghcr image ---
 git -C "$ROOT" var -l 2>/dev/null | grep -q '^user\.name=' || git -C "$ROOT" config user.name  "upstream-sync-bot"
 git -C "$ROOT" var -l 2>/dev/null | grep -q '^user\.email=' || git -C "$ROOT" config user.email "noreply@github.com"
 git -C "$ROOT" add gateway
