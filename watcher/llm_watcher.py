@@ -520,6 +520,7 @@ class Config:
     remove_grace: float = 300.0
     keep_last_per_model: bool = True
     fix_model_drift: bool = False
+    short_model_names: bool = False
     add_confirm_timeout: float = 180.0
     dry_run: bool = False
     health_check_interval_secs: int = 15
@@ -727,9 +728,22 @@ class Reconciler:
             live.add(url)
         return live
 
+    def _model_name(self, raw: str) -> str:
+        """Public model id. llama.cpp reports the served file path; a short
+        basename with the weights suffix dropped is friendlier as an API id."""
+        if not self.cfg.short_model_names:
+            return raw
+        name = raw.rstrip("/").rsplit("/", 1)[-1].strip()
+        low = name.lower()
+        for suffix in (".gguf", ".safetensors", ".bin", ".pt", ".ckpt"):
+            if low.endswith(suffix):
+                name = name[:-len(suffix)]
+                break
+        return name or raw
+
     def _add(self, info):
         cfg = self.cfg
-        model_id = info.models[0]
+        model_id = self._model_name(info.models[0])
         if len(info.models) > 1:
             LOG.info("%s serves %d models; registering as '%s' (the router keys one model per URL)",
                      info.url, len(info.models), model_id)
@@ -938,6 +952,11 @@ def build_arg_parser():
                         "[$LLM_WATCHER_KEEP_LAST]")
     p.add_argument("--fix-model-drift", action="store_true",
                    help="recycle a worker whose served model id changed on the same URL")
+    p.add_argument("--short-model-names", dest="short_model_names",
+                   action=argparse.BooleanOptionalAction,
+                   default=_env_bool("SHORT_MODEL_NAMES", False),
+                   help='register "/models/foo.gguf" as "foo" instead of the full served '
+                        "path [$LLM_WATCHER_SHORT_MODEL_NAMES]")
     p.add_argument("--add-confirm-timeout", type=float, default=_env_float("ADD_CONFIRM_TIMEOUT", 180.0))
     p.add_argument("--health-check-interval-secs", type=int, default=_env_int("HEALTH_CHECK_INTERVAL_SECS", 15))
     p.add_argument("--health-check-timeout-secs", type=int, default=_env_int("HEALTH_CHECK_TIMEOUT_SECS", 5))
@@ -982,6 +1001,7 @@ def main(argv=None):
         remove_grace=args.remove_grace,
         keep_last_per_model=args.keep_last,
         fix_model_drift=args.fix_model_drift,
+        short_model_names=args.short_model_names,
         add_confirm_timeout=args.add_confirm_timeout,
         dry_run=args.dry_run,
         health_check_interval_secs=args.health_check_interval_secs,

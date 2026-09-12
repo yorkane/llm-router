@@ -570,6 +570,36 @@ class TestReconcile(WatcherTestCase):
         self.assertFalse(os.path.exists(state))
         self.assertEqual(router.deleted, [])
 
+    def test_short_model_names_registers_basename(self):
+        srv = self.server(models=["/models/Qwen3.8-27B-SimPO-Q3-LynnStyle.gguf"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, short_model_names=True)
+        rec.reconcile()
+        self.assertEqual(len(router.added), 1)
+        self.assertEqual(router.added[0]["model_id"], "Qwen3.8-27B-SimPO-Q3-LynnStyle")
+
+    def test_model_names_untouched_without_the_flag(self):
+        srv = self.server(models=["/models/two/paths.gguf"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router)
+        rec.reconcile()
+        self.assertEqual(router.added[0]["model_id"], "/models/two/paths.gguf")
+
+    def test_short_model_names_flag_and_env(self):
+        import os as _os
+        old = _os.environ.get("LLM_WATCHER_SHORT_MODEL_NAMES")
+        _os.environ["LLM_WATCHER_SHORT_MODEL_NAMES"] = "true"
+        try:
+            args = W.build_arg_parser().parse_args([])
+            self.assertTrue(args.short_model_names)
+        finally:
+            if old is None:
+                _os.environ.pop("LLM_WATCHER_SHORT_MODEL_NAMES", None)
+            else:
+                _os.environ["LLM_WATCHER_SHORT_MODEL_NAMES"] = old
+        args = W.build_arg_parser().parse_args(["--no-short-model-names"])
+        self.assertFalse(args.short_model_names)
+
     def test_exclude_and_target_filtering(self):
         a = self.server(models=["a"])
         b = self.server(models=["b"])
