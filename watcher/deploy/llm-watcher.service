@@ -1,0 +1,44 @@
+# systemd unit for llm-watcher: keeps local inference services in the llm-router pool.
+#
+# Install (read the file first, then run):
+#   sudo mkdir -p /var/lib/llm-watcher
+#   sudo cp watcher/deploy/llm-watcher.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now llm-watcher
+#   journalctl -u llm-watcher -f
+#
+# The daemon needs nothing an ordinary user process lacks, except read access to
+# /var/run/docker.sock for container discovery. Drop the docker group (or add
+# --no-docker to ExecStart) if that discovery is not wanted.
+[Unit]
+Description=llm-watcher: auto-register local vLLM / sglang / llama.cpp into llm-router
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aigc
+Group=aigc
+SupplementaryGroups=docker
+WorkingDirectory=/home/aigc/ChatGPT/llm-router/watcher
+ExecStart=/usr/bin/python3 /home/aigc/ChatGPT/llm-router/watcher/llm_watcher.py \
+    --router http://127.0.0.1:8800 \
+    --state-dir /var/lib/llm-watcher \
+    --interval 15 \
+    --remove-grace 300 \
+    --metrics-port 9912
+Restart=always
+RestartSec=5
+# Never let a bug in the watcher take the box down with it.
+MemoryMax=256M
+CPUQuota=50%
+Nice=10
+Environment=PYTHONUNBUFFERED=1
+# Hardening: the daemon only speaks HTTP and reads /proc plus the docker socket.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llm-watcher
+
+[Install]
+WantedBy=multi-user.target

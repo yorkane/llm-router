@@ -1,0 +1,49 @@
+# llm-watcher as a compose service. Configure entirely by environment; no build needed
+# once the image is in ACR.
+#
+#   docker compose -f watcher/deploy/docker-compose.yml up -d
+#   docker logs -f llm-watcher
+#
+# network_mode: host is required, not cosmetic: without it /proc/net/tcp shows this
+# container's own namespace and local discovery finds nothing. On a box where host
+# networking is unavailable, set LLM_WATCHER_PROC_SCAN=false + LLM_WATCHER_DOCKER=false
+# and rely on LLM_WATCHER_TARGETS only.
+services:
+  llm-watcher:
+    image: wasu-wtvdev-registry-test-registry.cn-hangzhou.cr.aliyuncs.com/pub/llm-watcher:latest
+    container_name: llm-watcher
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # the router to keep in step
+      LLM_WATCHER_ROUTER: http://127.0.0.1:8800
+      # Bearer key for the router control plane, if it has one. Inject from the shell
+      # rather than committing a secret: LLM_WATCHER_ROUTER_API_KEY=... docker compose up -d
+      LLM_WATCHER_ROUTER_API_KEY: "${LLM_WATCHER_ROUTER_API_KEY:-}"
+
+      # ---- remote services, injected at container start ----
+      # These are probed like any other candidate, so they are reconciled the same way:
+      # a remote instance that stays unreachable is removed after the grace period.
+      # Append more per host without editing this file:
+      #   LLM_WATCHER_EXTRA_TARGETS='http://10.0.0.9:8000' docker compose up -d
+      LLM_WATCHER_TARGETS: ${LLM_WATCHER_EXTRA_TARGETS:-} http://10.252.25.217:8100 http://10.252.25.217:8101 http://10.252.25.217:8102 http://10.252.25.217:8103
+
+      # discovery scope inside the container
+      LLM_WATCHER_DOCKER: "true"
+      LLM_WATCHER_PROC_SCAN: "true"
+      # local sglang/vllm containers are reached through their published host ports,
+      # so the container-internal IPs add nothing but a second URL per instance
+      LLM_WATCHER_CONTAINER_IPS: "false"
+      # a remote instance is slower to fail; do not flap it
+      LLM_WATCHER_PROBE_TIMEOUT: "4"
+      LLM_WATCHER_REMOVE_GRACE: "300"
+      LLM_WATCHER_KEEP_LAST: "true"
+    volumes:
+      - llm-watcher-state:/var/lib/llm-watcher
+      # read-only: discovery only reads /containers/json
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      start_period: 120s
+
+volumes:
+  llm-watcher-state:
