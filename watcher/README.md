@@ -115,6 +115,7 @@ already write in compose files). Precedence: flag > `LLM_WATCHER_X` > plain `X` 
 | `LLM_WATCHER_ALLOW_PORT` / `_DENY_PORT` | Restrict which ports get probed |
 | `LLM_WATCHER_REQUIRE_HEALTH` / `_MAX_MODELS` | Tighten what counts as a worker |
 | `LLM_WATCHER_ALLOW_REMOVE` / `_REMOVE_GRACE` / `_KEEP_LAST` | Removal behaviour |
+| `LLM_WATCHER_SHORT_MODEL_NAMES` | Register `/models/foo.gguf` as `foo` (llama.cpp reports the full path) |
 | `LLM_WATCHER_METRICS_PORT` | Prometheus port, `0` disables it |
 
 A blank or unset value never overrides a default, and a value that is not a number is
