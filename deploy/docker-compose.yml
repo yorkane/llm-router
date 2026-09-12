@@ -1,0 +1,96 @@
+name: llm-router
+
+# Production pair: the smg router on :8800 and the llm-watcher that keeps its
+# worker pool in step with the LLM services actually running on this host
+# (vllm / llama.cpp / sglang, in containers or as bare processes).
+#
+#   docker compose up -d            # bring both up (router then watcher)
+#   docker compose logs -f llm-watcher
+#   curl -s localhost:9912/metrics   # watcher: adds/removes/discovered gauges
+#
+# Both use host networking: the router must own :8800 on the host, and the
+# watcher can only see host ports (and /proc/net/tcp) from the host netns.
+# The watcher also gets docker.sock read-only to discover container services
+# by their published ports. It never touches the GPU or model files.
+
+services:
+  llm-router:
+    image: ghcr.io/yorkane/llm-router:latest
+    container_name: llm-router-8800
+    network_mode: host
+    restart: unless-stopped
+    shm_size: 64m
+    # --enable-igw is required: the watcher will register workers that serve
+    # DIFFERENT model ids (the 8065 dflash build vs the 8012/8013 qwen), and
+    # without IGW the single-router ignores the requested model and would
+    # load-balance across them. With IGW each model id routes to its own pool.
+    command:
+      - "launch"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8800"
+      - "--backend"
+      - "sglang"
+      - "--policy"
+      - "cache_aware"
+      - "--enable-igw"
+      - "--worker-urls"
+      - "http://127.0.0.1:8012"
+      - "http://127.0.0.1:8013"
+      - "--cache-threshold"
+      - "0.2"
+      - "--balance-abs-threshold"
+      - "32"
+      - "--balance-rel-threshold"
+      - "1.5"
+      - "--eviction-interval"
+      - "120"
+      - "--max-tree-size"
+      - "50000"
+      - "--health-check-interval-secs"
+      - "30"
+      - "--health-check-timeout-secs"
+      - "5"
+      - "--worker-startup-timeout-secs"
+      - "1800"
+      - "--request-timeout-secs"
+      - "1800"
+      - "--prometheus-port"
+      - "29000"
+      - "--prometheus-host"
+      - "0.0.0.0"
+      - "--log-level"
+      - "info"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8800/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  llm-watcher:
+    image: llm-watcher:dev
+    container_name: llm-watcher
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - llm-router
+    environment:
+      LLM_WATCHER_ROUTER: "http://127.0.0.1:8800"
+      # ledger on a volume so a watcher restart keeps its ownership record
+      LLM_WATCHER_STATE_DIR: "/var/lib/llm-watcher"
+      LLM_WATCHER_DOCKER: "true"
+      LLM_WATCHER_PROC_SCAN: "true"
+      # container services are reached via their published host ports, so the
+      # container-internal IPs would just add a duplicate URL per instance
+      LLM_WATCHER_CONTAINER_IPS: "false"
+      LLM_WATCHER_PROBE_TIMEOUT: "4"
+      LLM_WATCHER_REMOVE_GRACE: "300"
+      LLM_WATCHER_METRICS_PORT: "9912"
+    volumes:
+      - "llm-watcher-state:/var/lib/llm-watcher"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+
+volumes:
+  llm-watcher-state:
