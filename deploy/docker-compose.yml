@@ -78,6 +78,9 @@ services:
       - llm-router
     environment:
       LLM_WATCHER_ROUTER: "http://127.0.0.1:8800"
+      # remote instances (217 box, ornith llama.cpp cluster); comma-separated,
+      # probed like local services, retired after the grace period if unreachable
+      LLM_WATCHER_TARGETS: "http://10.252.25.217:8100,http://10.252.25.217:8101,http://10.252.25.217:8102,http://10.252.25.217:8103"
       # ledger on a volume so a watcher restart keeps its ownership record
       LLM_WATCHER_STATE_DIR: "/var/lib/llm-watcher"
       LLM_WATCHER_DOCKER: "true"
