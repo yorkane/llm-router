@@ -673,5 +673,105 @@ class TestReconcile(WatcherTestCase):
         messages = [c.args[0] if c.args else "" for c in warn.call_args_list]
         self.assertEqual([m for m in messages if "enable-igw" in str(m)], [])
 
+
+class TestModelMap(WatcherTestCase):
+    def test_parse_model_map_accepts_separators_and_skips_junk(self):
+        self.assertEqual(W.parse_model_map("a:foo,b:bar"), {"a": "foo", "b": "bar"})
+        self.assertEqual(W.parse_model_map(" a : foo ; b:bar\n"), {"a": "foo", "b": "bar"})
+        self.assertEqual(W.parse_model_map("broken,a:foo"), {"a": "foo"})
+        self.assertEqual(W.parse_model_map(""), {})
+
+    def test_env_names_including_the_LMR_MODLE_MAP_typo(self):
+        for name in ("LMR_MODEL_MAP", "LMR_MODLE_MAP", "LLM_WATCHER_MODEL_MAP"):
+            saved = {k: os.environ.get(k) for k in
+                     ("MODEL_MAP", "MODEL_ID_MAP", "MODEL_RENAME", "LMR_MODEL_MAP",
+                      "LMR_MODLE_MAP", "LLM_WATCHER_MODEL_MAP")}
+            os.environ[name] = "old:new"
+            try:
+                merged = W.parse_model_map(W._env("MODEL_MAP", "MODEL_ID_MAP",
+                                                  "MODEL_RENAME", "LMR_MODEL_MAP",
+                                                  "LMR_MODLE_MAP", default=""))
+                self.assertEqual(merged, {"old": "new"})
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    def test_map_wins_over_short_names_at_registration(self):
+        srv = self.server(models=["/models/Qwen3.8-27B-Lynn.gguf"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, short_model_names=True,
+                              model_map={"/models/Qwen3.8-27B-Lynn.gguf": "lynn"})
+        rec.reconcile()
+        self.assertEqual(router.added[0]["model_id"], "lynn")
+
+    def test_map_may_key_on_the_short_name_as_well(self):
+        srv = self.server(models=["/models/Qwen3.8-27B-Lynn.gguf"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, short_model_names=True,
+                              model_map={"Qwen3.8-27B-Lynn": "lynn"})
+        rec.reconcile()
+        self.assertEqual(router.added[0]["model_id"], "lynn")
+
+    def test_map_change_recycles_an_owned_worker_onto_the_new_id(self):
+        srv = self.server(models=["m-orig"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router)
+        rec.reconcile()
+        self.assertEqual(router.added[0]["model_id"], "m-orig")
+        # runtime API rename -> next pass deletes and re-adds under the new id
+        rec.set_model_map({"m-orig": "m-friendly"})
+        rec.reconcile()
+        self.assertEqual(len(router.deleted), 1)
+        rec.reconcile()
+        self.assertEqual([a["model_id"] for a in router.added][-1], "m-friendly")
+        self.assertEqual(rec.ledger.owned[srv.url]["model_id"], "m-friendly")
+
+    def test_renamed_worker_is_not_recycled_repeatedly(self):
+        srv = self.server(models=["m-orig"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, model_map={"m-orig": "m-new"})
+        rec.reconcile()          # add as m-new
+        n_adds = len(router.added)
+        rec.reconcile()
+        rec.reconcile()
+        self.assertEqual(len(router.added), n_adds)
+        self.assertEqual(router.deleted, [])
+
+    def test_model_map_persists_in_the_ledger_and_reloads(self):
+        state = os.path.join(self._tmp, "state-map")
+        rec = W.Reconciler(make_cfg(state, []))
+        rec.set_model_map({"a": "x", "b": "y"})
+        rec.set_model_map({"b": ""})          # empty new id deletes
+        again = W.Reconciler(make_cfg(state, []))
+        self.assertEqual(again.ledger.model_map, {"a": "x"})
+
+    def test_model_map_http_api_roundtrip(self):
+        import http.client
+        srv = self.server(models=["m-orig"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router)
+        rec.reconcile()
+        server = W.start_metrics(rec, 0)
+        port = server.server_address[1]
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/model-map", body='{"m-orig": "m-api"}')
+            res = conn.getresponse()
+            self.assertEqual(res.status, 200)
+            self.assertEqual(json.loads(res.read())["model_map"], {"m-orig": "m-api"})
+            conn.request("GET", "/model-map")
+            res = conn.getresponse()
+            self.assertEqual(json.loads(res.read()), {"m-orig": "m-api"})
+            conn.request("POST", "/model-map", body="m-orig:")   # empty new id deletes
+            res = conn.getresponse()
+            self.assertEqual(json.loads(res.read())["model_map"], {})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

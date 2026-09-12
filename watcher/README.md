@@ -94,6 +94,7 @@ Pull `python:3.12-alpine` through the ACR mirror instead of docker.io (see skill
 | `--remove-grace` / `--allow-remove false` | How eagerly dead services are dropped. |
 | `--worker-api-key` | Key the router should present to the workers; it does not inherit its own. |
 | `--fix-model-drift` | Recycle a worker whose served model id changed on the same URL (a weight swap). Off by default: it only warns. |
+| `--model-map ORIGINAL:NEW` | Publish a worker under a different public model id (repeatable). See "Renaming model ids" below. |
 
 `--once` runs one pass and exits, which is what cron or CI wants.
 
@@ -116,6 +117,7 @@ already write in compose files). Precedence: flag > `LLM_WATCHER_X` > plain `X` 
 | `LLM_WATCHER_REQUIRE_HEALTH` / `_MAX_MODELS` | Tighten what counts as a worker |
 | `LLM_WATCHER_ALLOW_REMOVE` / `_REMOVE_GRACE` / `_KEEP_LAST` | Removal behaviour |
 | `LLM_WATCHER_SHORT_MODEL_NAMES` | Register `/models/foo.gguf` as `foo` (llama.cpp reports the full path) |
+| `LLM_WATCHER_MODEL_MAP` | Renames as `orig1:new1,orig2:new2`; the `LMR_MODEL_MAP` / `LMR_MODLE_MAP` spellings are honoured too |
 | `LLM_WATCHER_METRICS_PORT` | Prometheus port, `0` disables it |
 
 A blank or unset value never overrides a default, and a value that is not a number is
@@ -128,6 +130,29 @@ is safe but forgets the protection snapshot, so only do that against an empty po
 `--metrics-port` a small Prometheus endpoint exposes `llm_watcher_adds_total`,
 `removes_total`, `discovered_workers`, `owned_workers`, `protected_workers` and
 `router_reachable`.
+
+## Renaming model ids (model map)
+
+Some backends advertise an awkward public id (llama.cpp serves the full
+`/models/xxx.gguf` path). A model map rewrites only the id the router exposes; the
+worker itself is untouched. The key is the id the service reports (`/models/x.gguf`), or the short name when `--short-model-names` is on. Precedence per original id: `POST /model-map` (saved in
+the ledger) > `--model-map` flags > environment variable.
+
+```bash
+# at start, via env (compose) or repeatable flags
+LLM_WATCHER_MODEL_MAP="/models/Qwen3.8-27B.gguf:qwen38,gpt-oss-120b:gpt-oss"
+python3 watcher/llm_watcher.py --model-map "a.gguf:a" --model-map "b.gguf:b"
+
+# at runtime, on the metrics port -- applied on the next reconcile pass
+curl -s localhost:9912/model-map                        # current map as JSON
+curl -s -X POST localhost:9912/model-map -d '{"a.gguf":"a"}'   # JSON, or "a.gguf:a"
+curl -s -X POST localhost:9912/model-map -d '{"a.gguf":""}'    # delete one entry
+```
+
+Changing the id of a worker the watcher already owns makes it delete and re-add that
+worker under the new name on the next pass; protected workers are never touched.
+The map lives in the ledger, so API edits survive a restart; in-flight requests are
+not replayed against the old id.
 
 ## Tests
 

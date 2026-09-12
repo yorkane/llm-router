@@ -92,6 +92,18 @@ def _env_bool(name, default):
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def parse_model_map(spec):
+    """Parse `orig1:new1,orig2:new2` into {orig: new}. Empty values drop nothing."""
+    out = {}
+    for part in filter(None, (s.strip() for s in re.split(r"[,;\n]", spec or ""))):
+        orig, sep, new = part.partition(":")
+        if not sep or not orig.strip() or not new.strip():
+            LOG.warning("ignoring bad model-map entry %r (want original:new)", part)
+            continue
+        out[orig.strip()] = new.strip()
+    return out
+
+
 def parse_targets(spec):
     """Split a worker-URL list from env/comma/space separated text."""
     if not spec:
@@ -463,6 +475,7 @@ class Ledger:
         self.owned: Dict[str, dict] = {}
         self.missing_since: Dict[str, float] = {}
         self.warned: Set[str] = set()
+        self.model_map: Dict[str, str] = {}
         self._load()
 
     def _load(self):
@@ -477,6 +490,7 @@ class Ledger:
         self.protected = {normalize_url(str(u)) for u in data.get("protected", [])}
         self.owned = {normalize_url(str(k)): v for k, v in (data.get("owned") or {}).items()}
         self.missing_since = {normalize_url(str(k)): float(v) for k, v in (data.get("missing_since") or {}).items()}
+        self.model_map = {str(k): str(v) for k, v in (data.get("model_map") or {}).items()}
         LOG.info("ledger loaded: %d owned, %d protected", len(self.owned), len(self.protected))
 
     def save(self):
@@ -488,6 +502,7 @@ class Ledger:
             "protected": sorted(self.protected),
             "owned": self.owned,
             "missing_since": self.missing_since,
+            "model_map": getattr(self, "model_map", {}),
             "updated_at": int(time.time()),
         }
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
@@ -521,6 +536,7 @@ class Config:
     keep_last_per_model: bool = True
     fix_model_drift: bool = False
     short_model_names: bool = False
+    model_map: Dict[str, str] = field(default_factory=dict)
     add_confirm_timeout: float = 180.0
     dry_run: bool = False
     health_check_interval_secs: int = 15
@@ -541,6 +557,25 @@ class Reconciler:
         self._exclude = [re.compile(p) for p in cfg.exclude]
         self._pending: Dict[str, dict] = {}
         self.stats = {"reconciles": 0, "adds": 0, "removes": 0, "discovered": 0, "last_error": ""}
+
+    def model_map(self) -> Dict[str, str]:
+        """Current original-id -> public-id renames."""
+        return dict(self.cfg.model_map)
+
+    def set_model_map(self, mapping: Dict[str, object]) -> Dict[str, str]:
+        """Merge renames at runtime (POST /model-map). An empty new id deletes an entry."""
+        merged = self.cfg.model_map
+        for orig, new in (mapping or {}).items():
+            orig = str(orig).strip()
+            if not orig:
+                continue
+            if new is None or not str(new).strip():
+                merged.pop(orig, None)
+            else:
+                merged[orig] = str(new).strip()
+        self.ledger.model_map = dict(merged)
+        self.ledger.save()
+        return dict(merged)
 
     def collect(self):
         cfg = self.cfg
@@ -637,6 +672,18 @@ class Reconciler:
             if url not in actual and url not in pending:
                 self._add(info)
 
+        # model_map (or --short-model-names) changed: recycle owned workers so the
+        # next pass re-adds them under the new public id. Protected workers stay.
+        for url, info in sorted(desired.items()):
+            entry = self.ledger.owned.get(url)
+            if not entry or url in self._pending or url not in actual:
+                continue
+            want = self._model_name(info.models[0])
+            have = str(actual[url].get("model_id") or "")
+            if entry.get("model_id") != want and have != want:
+                LOG.info("Rename %s: registered %r, want %r; re-registering", url, have, want)
+                self._remove(url, entry, 0.0)
+
         for url, entry in sorted(list(self.ledger.owned.items())):
             if url in desired:
                 self.ledger.missing_since.pop(url, None)
@@ -730,16 +777,19 @@ class Reconciler:
 
     def _model_name(self, raw: str) -> str:
         """Public model id. llama.cpp reports the served file path; a short
-        basename with the weights suffix dropped is friendlier as an API id."""
-        if not self.cfg.short_model_names:
-            return raw
-        name = raw.rstrip("/").rsplit("/", 1)[-1].strip()
-        low = name.lower()
-        for suffix in (".gguf", ".safetensors", ".bin", ".pt", ".ckpt"):
-            if low.endswith(suffix):
-                name = name[:-len(suffix)]
-                break
-        return name or raw
+        basename with the weights suffix dropped is friendlier as an API id. A
+        model-map entry wins over that, and may key on either the raw id or the
+        short name, so both spellings work in a compose file."""
+        name = raw
+        if self.cfg.short_model_names:
+            name = raw.rstrip("/").rsplit("/", 1)[-1].strip()
+            low = name.lower()
+            for suffix in (".gguf", ".safetensors", ".bin", ".pt", ".ckpt"):
+                if low.endswith(suffix):
+                    name = name[:-len(suffix)]
+                    break
+            name = name or raw
+        return self.cfg.model_map.get(raw) or self.cfg.model_map.get(name) or name
 
     def _add(self, info):
         cfg = self.cfg
@@ -851,10 +901,27 @@ def start_metrics(reconciler, port):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
+        # The metrics port doubles as the control plane: GET/POST /model-map
+        # changes the original-id -> public-id renames without a restart.
+        def _reply(self, code, body, ctype="text/plain; version=0.0.4"):
+            raw = body.encode()
+            self.send_response(code)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _json(self, code, obj):
+            self._reply(code, json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                        "application/json")
+
         def do_GET(self):
-            if self.path.rstrip("/") not in ("/metrics", ""):
-                self.send_response(404)
-                self.end_headers()
+            path = self.path.split("?")[0].rstrip("/")
+            if path == "/model-map":
+                self._json(200, reconciler.model_map())
+                return
+            if path not in ("/metrics", ""):
+                self._reply(404, "not found\n")
                 return
             rec = reconciler
             lines = [
@@ -864,21 +931,63 @@ def start_metrics(reconciler, port):
                 "llm_watcher_discovered_workers %d" % rec.stats["discovered"],
                 "llm_watcher_owned_workers %d" % len(rec.ledger.owned),
                 "llm_watcher_protected_workers %d" % len(rec.ledger.protected),
+                "llm_watcher_model_map_entries %d" % len(rec.cfg.model_map),
                 "llm_watcher_router_reachable %d" % (0 if rec.stats["last_error"] else 1),
             ]
-            body = ("\n".join(lines) + "\n").encode()
-            self.send_response(200)
-            self.send_header("content-type", "text/plain; version=0.0.4")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._reply(200, "\n".join(lines) + "\n")
+
+        def do_POST(self):
+            if self.path.split("?")[0].rstrip("/") != "/model-map":
+                self._reply(404, "not found\n")
+                return
+            try:
+                n = int(self.headers.get("content-length") or 0)
+                raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            except Exception:
+                raw = ""
+            raw = raw.strip()
+            if not raw:
+                self._json(400, {"error": 'empty body; send {"original":"new"} or '
+                                          "original:new (an empty new id deletes the entry)"})
+                return
+            if raw.startswith("{"):
+                try:
+                    obj = json.loads(raw)
+                except Exception as exc:
+                    self._json(400, {"error": "invalid JSON: %s" % exc})
+                    return
+                if not isinstance(obj, dict):
+                    self._json(400, {"error": "JSON body must be an object"})
+                    return
+                if isinstance(obj.get("map"), dict):
+                    obj = obj["map"]
+                mapping = {str(k): ("" if v is None else str(v)) for k, v in obj.items()}
+            else:
+                mapping, bad = {}, []
+                for part in re.split(r"[,;\n]+", raw):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    orig, sep, new = part.partition(":")
+                    if not sep or not orig.strip():
+                        bad.append(part)
+                        continue
+                    mapping[orig.strip()] = new.strip()
+                if bad:
+                    self._json(400, {"error": "want original:new per entry", "ignored": bad})
+                    return
+            merged = reconciler.set_model_map(mapping)
+            LOG.info("model-map updated via API -> %s", merged)
+            self._json(200, {"model_map": merged,
+                             "note": "owned workers are re-registered on the next pass"})
 
         def log_message(self, *args):
             return
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    LOG.info("metrics on :%d/metrics", port)
+    LOG.info("metrics on :%d/metrics, model map API on :%d/model-map", port, port)
+    return server
 
 
 def parse_ports(spec):
@@ -957,6 +1066,12 @@ def build_arg_parser():
                    default=_env_bool("SHORT_MODEL_NAMES", False),
                    help='register "/models/foo.gguf" as "foo" instead of the full served '
                         "path [$LLM_WATCHER_SHORT_MODEL_NAMES]")
+    p.add_argument("--model-map", action="append", dest="model_maps", default=[],
+                   metavar="ORIGINAL:NEW",
+                   help='register a worker under a different public model id, e.g. '
+                        "'/models/foo.gguf:foo' (repeatable). The environment accepts "
+                        "the same pairs comma separated in LMR_MODEL_MAP / LMR_MODLE_MAP "
+                        "[$LLM_WATCHER_MODEL_MAP]")
     p.add_argument("--add-confirm-timeout", type=float, default=_env_float("ADD_CONFIRM_TIMEOUT", 180.0))
     p.add_argument("--health-check-interval-secs", type=int, default=_env_int("HEALTH_CHECK_INTERVAL_SECS", 15))
     p.add_argument("--health-check-timeout-secs", type=int, default=_env_int("HEALTH_CHECK_TIMEOUT_SECS", 5))
@@ -1002,6 +1117,10 @@ def main(argv=None):
         keep_last_per_model=args.keep_last,
         fix_model_drift=args.fix_model_drift,
         short_model_names=args.short_model_names,
+        model_map=parse_model_map(
+            _env("MODEL_MAP", "MODEL_ID_MAP", "MODEL_RENAME",
+                 "LMR_MODEL_MAP", "LMR_MODLE_MAP", default="")
+        ),
         add_confirm_timeout=args.add_confirm_timeout,
         dry_run=args.dry_run,
         health_check_interval_secs=args.health_check_interval_secs,
@@ -1015,6 +1134,14 @@ def main(argv=None):
         LOG.error("nothing to scan: combine --no-proc-scan/--no-docker with --target or --allow-port")
         return 2
     reconciler = Reconciler(cfg)
+    # Renames: env < --model-map flags < whatever POST /model-map saved earlier, so an
+    # API change survives a restart. Delete a saved entry with {"original": ""}.
+    for spec in args.model_maps:
+        cfg.model_map.update(parse_model_map(spec))
+    cfg.model_map.update(reconciler.ledger.model_map)
+    reconciler.ledger.model_map = dict(cfg.model_map)
+    if cfg.model_map:
+        LOG.info("model map: %s", ", ".join("%s -> %s" % kv for kv in sorted(cfg.model_map.items())))
     if not reconciler.router.health():
         LOG.error("router %s/health did not answer; refusing to start", reconciler.router.base)
         return 3
