@@ -264,6 +264,22 @@ class TestEnvironment(WatcherTestCase):
         self.assertIs(args.allow_remove, False)
 
     def test_command_line_beats_environment(self):
+        args = W.build_arg_parser().parse_args(["--interval", "7"])
+        self.assertEqual(args.interval, 7.0)
+
+    def test_main_only_touches_flags_the_parser_declares(self):
+        # A flag block misplaced outside build_arg_parser (dead code after
+        # sys.exit) imports fine and still crashes main() at startup; catch it here
+        # by requiring every args.<attr> that main() reads to be declared.
+        import ast as _ast
+        import inspect
+        tree = _ast.parse(inspect.getsource(W.main))
+        used = {node.attr for node in _ast.walk(tree)
+                if isinstance(node, _ast.Attribute)
+                and isinstance(node.value, _ast.Name) and node.value.id == "args"}
+        declared = {a.dest for a in W.build_arg_parser()._actions if a.dest}
+        self.assertEqual(sorted(used - declared), [])
+        self.assertTrue(used, "main() should read some flags")
         env = {"LLM_WATCHER_ROUTER": "http://from-env:1", "LLM_WATCHER_TARGETS": "http://env:1"}
         with unittest.mock.patch.dict(os.environ, env, clear=False):
             parser = W.build_arg_parser()

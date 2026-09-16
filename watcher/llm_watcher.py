@@ -1086,6 +1086,13 @@ def build_arg_parser():
     p.add_argument("--require-health", action="store_true",
                    default=_env_bool("REQUIRE_HEALTH", False),
                    help="only accept services answering 2xx on /health [$LLM_WATCHER_REQUIRE_HEALTH]")
+    p.add_argument("--allow-models-only", dest="allow_models_only",
+                   action=argparse.BooleanOptionalAction,
+                   default=_env_bool("ALLOW_MODELS_ONLY", False),
+                   help="accept a worker that only answers /v1/models, with no /health or "
+                        "/metrics endpoint; by default such endpoints are treated as "
+                        "proxies and skipped [$LLM_WATCHER_ALLOW_MODELS_ONLY]")
+
     p.add_argument("--max-models", type=int, default=_env_int("MAX_MODELS", 8),
                    help="ignore servers advertising more than this many models, i.e. aggregators and "
                         "other proxies that would add a hop or loop back (0 = no limit) "
@@ -1208,9 +1215,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-    p.add_argument("--allow-models-only", dest="allow_models_only",
-                   action=argparse.BooleanOptionalAction,
-                   default=_env_bool("ALLOW_MODELS_ONLY", False),
-                   help="accept a worker that only answers /v1/models, with no /health or "
-                        "/metrics endpoint; by default such endpoints are treated as "
-                        "proxies and skipped [$LLM_WATCHER_ALLOW_MODELS_ONLY]")
