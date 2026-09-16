@@ -34,10 +34,11 @@ class Endpoint:
     """Minimal OpenAI-ish server: models list, optional /health, optional engine hints."""
 
     def __init__(self, models=("m1",), health=True, extra=None, html_instead=False,
-                 raw=None):
+                 raw=None, down=()):
         self.models = list(models)
         self.health = health
         self.extra = extra or {}
+        self.down = set(down)       # paths that answer 502, like a proxy with a dead upstream
         self.html_instead = html_instead
         self.raw = raw or {}          # path -> (content_type, body) verbatim answers
         self.calls = []
@@ -74,6 +75,9 @@ class Endpoint:
                     self.send_header("content-length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)
+                    return
+                if path in srv.down:
+                    self._html(502)
                     return
                 if path in srv.extra:
                     obj = srv.extra[path]
@@ -356,6 +360,19 @@ class TestProbe(WatcherTestCase):
         self.assertIsNotNone(W.probe_worker(srv.url, require_health=False))
         self.assertIsNone(W.probe_worker(srv.url, require_health=True))
 
+    def test_openai_gateway_proxy_is_not_a_worker(self):
+        # 21.k's openresty: /v1/models proxied, every other path a 502 error page.
+        srv = self.server(down=("/health", "/metrics"))
+        self.assertIsNone(W.probe_worker(srv.url))
+        self.assertIsNotNone(W.probe_worker(srv.url, allow_models_only=True))
+
+    def test_plain_engine_without_endpoints_is_still_a_worker(self):
+        # 404 means "engine has no such endpoint", not "proxy": must still register.
+        srv = self.server(health=False)
+        info = W.probe_worker(srv.url)
+        self.assertIsNotNone(info)
+        self.assertFalse(info.has_health)
+
 
 class TestDiscovery(unittest.TestCase):
     def test_listening_sockets_shape(self):
@@ -541,6 +558,45 @@ class TestReconcile(WatcherTestCase):
         rec.reconcile()                                            # worker still there
         self.assertEqual(router.deleted, [])
         self.assertNotIn(srv.url, rec.ledger.missing_since)
+
+    def test_rejected_add_backs_off_instead_of_churning(self):
+        # A web gateway answers /v1/models, so discovery likes it, but the router's
+        # AddWorker job ends "failed". The watcher must stop re-adding it every pass.
+        class RejectingRouter(FakeRouter):
+            def job_status(self, worker_id):
+                return "failed"
+
+        srv = self.server(models=["gateway-ish"])
+        router = RejectingRouter()
+        rec = self.reconciler([srv.url], router, add_confirm_timeout=0.0)
+        rec.reconcile()                                  # queued
+        rec.reconcile()                                  # job failed -> released, backed off
+        n = len(router.added)
+        self.assertEqual(n, 1)
+        for _ in range(5):
+            rec.reconcile()                              # back-off window -> silence
+        self.assertEqual(len(router.added), n)
+
+    def test_exclude_env_variable_is_honoured(self):
+        import os as _os
+        srv = self.server(models=["m1"])
+        cand = W.Candidate(url=srv.url, source="cli", label="x")
+        pattern = srv.url + "$"   # FakeServer binds an ephemeral port
+        old = _os.environ.get("LLM_WATCHER_EXCLUDE")
+        _os.environ["LLM_WATCHER_EXCLUDE"] = pattern
+        try:
+            args = W.build_arg_parser().parse_args([])
+            merged = list(args.exclude) + W.parse_targets(W._env("EXCLUDE", default=""))
+            self.assertEqual(merged, [pattern])
+            rec = self.reconciler([srv.url], FakeRouter(), exclude=merged)
+            self.assertEqual(rec.probe_all([cand]), [])       # filtered out
+        finally:
+            if old is None:
+                _os.environ.pop("LLM_WATCHER_EXCLUDE", None)
+            else:
+                _os.environ["LLM_WATCHER_EXCLUDE"] = old
+        rec2 = self.reconciler([srv.url], FakeRouter())
+        self.assertEqual(len(rec2.probe_all([cand])), 1)      # passes without it
 
     def test_stuck_add_releases_the_url(self):
         class StuckRouter(FakeRouter):

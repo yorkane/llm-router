@@ -114,7 +114,9 @@ already write in compose files). Precedence: flag > `LLM_WATCHER_X` > plain `X` 
 | `LLM_WATCHER_INTERVAL` / `_PROBE_TIMEOUT` / `_WORKERS` | Loop cadence and probe tuning |
 | `LLM_WATCHER_DOCKER` / `_PROC_SCAN` / `_CONTAINER_IPS` | Turn a discovery source off with `false` |
 | `LLM_WATCHER_ALLOW_PORT` / `_DENY_PORT` | Restrict which ports get probed |
+| `LLM_WATCHER_EXCLUDE` | Regexes of URLs never to touch (comma separated; `--exclude` flags add to them) |
 | `LLM_WATCHER_REQUIRE_HEALTH` / `_MAX_MODELS` | Tighten what counts as a worker |
+| `LLM_WATCHER_ALLOW_MODELS_ONLY` | Register endpoints that answer only `/v1/models` (no /health or /metrics); by default those are skipped as gateways |
 | `LLM_WATCHER_ALLOW_REMOVE` / `_REMOVE_GRACE` / `_KEEP_LAST` | Removal behaviour |
 | `LLM_WATCHER_KEEP_LAST_GRACE` | How long the last-worker protection lasts before a dead worker is removed anyway; `0` = forever (old behaviour) |
 | `LLM_WATCHER_SHORT_MODEL_NAMES` | Register `/models/foo.gguf` as `foo` (llama.cpp reports the full path) |

@@ -339,7 +339,7 @@ def local_candidates(deny):
     return cands
 
 
-def probe_worker(url, timeout=3.0, require_health=False, max_models=0):
+def probe_worker(url, timeout=3.0, require_health=False, max_models=0, allow_models_only=False):
     """Return WorkerInfo when url really is an OpenAI-compatible inference server."""
     status, payload, raw = http_json(url + "/v1/models", timeout=timeout)
     if status < 200 or status >= 400 or raw is None:
@@ -387,6 +387,24 @@ def probe_worker(url, timeout=3.0, require_health=False, max_models=0):
     has_health = 200 <= st_health < 400
     if require_health and not has_health:
         LOG.debug("Skipping %s: no usable /health endpoint", url)
+        return None
+    # /v1/models alone is not enough to call something a worker: an API gateway that
+    # only proxies the /v1 surface answers it happily while /health and /metrics 502
+    # (measured on 21.k's openresty :9080 -- it registered as a worker, then every
+    # AddWorker job the router queued ended "failed"). Real engines (llama.cpp, vLLM,
+    # sglang) always expose one of the two, so ask for a second signal unless the
+    # operator opted in to /v1/models-only endpoints.
+    # /v1/models alone is not enough to call something a worker: an API gateway that
+    # proxies only the /v1 surface answers it happily while every non-/v1 path comes
+    # back as a 502 error page (measured on 21.k's openresty :9080 -- it registered as
+    # a worker, then every AddWorker job the router queued ended "failed"). A 404 only
+    # means the engine did not implement that endpoint, so only a 5xx on both /health
+    # and /metrics -- a gateway refusing to forward -- is treated as a proxy signal.
+    proxyish = st_health >= 500 and st_met >= 500
+    if engine == "openai" and proxyish and not allow_models_only:
+        LOG.info("Skipping %s: /v1/models answers but /health and /metrics both 5xx -- "
+                 "an upstream/gateway, not a worker (exclude it, or pass "
+                 "--allow-models-only to register it anyway)", url)
         return None
     return WorkerInfo(url=url, models=ids, engine=engine, has_health=has_health)
 
@@ -531,6 +549,7 @@ class Config:
     scan_container_ips: bool = True
     require_health: bool = False
     max_models: int = 8
+    allow_models_only: bool = False
     allow_remove: bool = True
     remove_grace: float = 300.0
     keep_last_per_model: bool = True
@@ -557,6 +576,10 @@ class Reconciler:
         self.ledger = Ledger(os.path.join(cfg.state_dir, "ledger.json"), read_only=cfg.dry_run)
         self._exclude = [re.compile(p) for p in cfg.exclude]
         self._pending: Dict[str, dict] = {}
+        # URLs whose AddWorker job the router rejected outright (a web/API gateway
+        # answers /v1/models but is not a worker, so the job lands in "failed").
+        # Retrying every pass just churns; back off exponentially instead.
+        self._add_fails: Dict[str, dict] = {}
         self.stats = {"reconciles": 0, "adds": 0, "removes": 0, "discovered": 0, "last_error": ""}
 
     def model_map(self) -> Dict[str, str]:
@@ -620,7 +643,8 @@ class Reconciler:
             if any(pat.search(item.url) for pat in self._exclude):
                 return None
             info = probe_worker(item.url, timeout=cfg.probe_timeout, require_health=cfg.require_health,
-                                max_models=cfg.max_models)
+                                max_models=cfg.max_models,
+                                allow_models_only=cfg.allow_models_only)
             if info is None:
                 return None
             info.label = item.label or info.engine
@@ -771,6 +795,12 @@ class Reconciler:
             status = self.router.job_status(meta["worker_id"]) if meta.get("worker_id") else "unknown"
             LOG.warning("AddWorker for %s not registered after %.0fs (job status: %s); releasing the URL",
                         url, age, status)
+            if status == "failed":
+                f = self._add_fails.setdefault(url, {"n": 0, "until": 0.0})
+                f["n"] += 1
+                f["until"] = time.time() + min(900.0, 30.0 * (2 ** f["n"]))
+                LOG.warning("%s add rejected %d time(s); retrying in %.0fs (is it really a worker, "
+                            "or a gateway? exclude it if so)", url, f["n"], f["until"] - time.time())
             if status in ("processing", "pending") and meta.get("worker_id"):
                 ok, detail = self.router.delete(meta["worker_id"])
                 if not ok:
@@ -800,6 +830,9 @@ class Reconciler:
 
     def _add(self, info):
         cfg = self.cfg
+        fail = self._add_fails.get(info.url)
+        if fail and time.time() < fail["until"]:
+            return      # in back-off after a rejected AddWorker job
         model_id = self._model_name(info.models[0])
         if len(info.models) > 1:
             LOG.info("%s serves %d models; registering as '%s' (the router keys one model per URL)",
@@ -826,6 +859,7 @@ class Reconciler:
                 return
             LOG.error("ADD %s failed: %s", info.url, detail)
             return
+        self._add_fails.pop(info.url, None)
         self.stats["adds"] += 1
         self._pending[info.url] = {"queued_at": time.time(), "worker_id": worker_id}
         self.ledger.owned[info.url] = {
@@ -1112,7 +1146,7 @@ def main(argv=None):
         workers=args.workers,
         deny_ports=parse_ports(args.deny_port),
         allow_ports=parse_ports(args.allow_port),
-        exclude=list(args.exclude),
+        exclude=list(args.exclude) + parse_targets(_env("EXCLUDE", default="")),
         scan_proc=args.proc_scan,
         scan_docker=args.docker,
         scan_container_ips=args.container_ips,
@@ -1121,6 +1155,7 @@ def main(argv=None):
             _env("TARGETS", "WORKER_URLS", "REMOTE_WORKERS", default="")
         ),
         require_health=args.require_health,
+        allow_models_only=args.allow_models_only,
         max_models=max(0, args.max_models),
         allow_remove=args.allow_remove,
         remove_grace=args.remove_grace,
@@ -1173,3 +1208,9 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+    p.add_argument("--allow-models-only", dest="allow_models_only",
+                   action=argparse.BooleanOptionalAction,
+                   default=_env_bool("ALLOW_MODELS_ONLY", False),
+                   help="accept a worker that only answers /v1/models, with no /health or "
+                        "/metrics endpoint; by default such endpoints are treated as "
+                        "proxies and skipped [$LLM_WATCHER_ALLOW_MODELS_ONLY]")
