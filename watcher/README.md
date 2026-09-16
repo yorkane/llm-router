@@ -33,7 +33,7 @@ never as a routing decision.
 | Protects your config | On first contact, every worker already in the pool (from `--worker-urls` or added by hand) is snapshotted as `protected` and never deleted. |
 | Only deletes what it owns | Removals come from a local ledger of workers this daemon added itself. |
 | Grace period | A worker is removed only after being undiscovered for `--remove-grace` (default 300s). Short restarts stay the router's job: it marks the worker unhealthy and keeps the slot. |
-| Never empties a model | The last worker of a model is kept and warned about instead of deleted (`--no-keep-last` overrides). |
+| Never empties a model | The last worker of a model is kept and warned about instead of deleted (`--no-keep-last` overrides); the protection expires after `--keep-last-grace` (default 30 min), so a permanently stopped service is removed and its model leaves the pool instead of serving 5xx forever. |
 | Releases stuck adds | A `202` only means "queued". An AddWorker job parked forever on a dead URL also squats that URL (every retry says `already exists`), so the watcher deletes it and re-adds on the next pass. |
 | Survives a router restart | Recorded worker ids are refreshed from `GET /workers`, otherwise a later `DELETE` would 404. |
 | Warns on mixed models | A single-router `smg` ignores the requested model when choosing a worker (measured: 10/10 requests naming the local model were served by a remote one, both returning 200). The daemon cannot fix that, so it logs one warning pointing at `--enable-igw` as soon as a second model appears. |
@@ -116,6 +116,7 @@ already write in compose files). Precedence: flag > `LLM_WATCHER_X` > plain `X` 
 | `LLM_WATCHER_ALLOW_PORT` / `_DENY_PORT` | Restrict which ports get probed |
 | `LLM_WATCHER_REQUIRE_HEALTH` / `_MAX_MODELS` | Tighten what counts as a worker |
 | `LLM_WATCHER_ALLOW_REMOVE` / `_REMOVE_GRACE` / `_KEEP_LAST` | Removal behaviour |
+| `LLM_WATCHER_KEEP_LAST_GRACE` | How long the last-worker protection lasts before a dead worker is removed anyway; `0` = forever (old behaviour) |
 | `LLM_WATCHER_SHORT_MODEL_NAMES` | Register `/models/foo.gguf` as `foo` (llama.cpp reports the full path) |
 | `LLM_WATCHER_MODEL_MAP` | Renames as `orig1:new1,orig2:new2`; the `LMR_MODEL_MAP` / `LMR_MODLE_MAP` spellings are honoured too |
 | `LLM_WATCHER_METRICS_PORT` | Prometheus port, `0` disables it |

@@ -534,6 +534,7 @@ class Config:
     allow_remove: bool = True
     remove_grace: float = 300.0
     keep_last_per_model: bool = True
+    keep_last_grace: float = 1800.0
     fix_model_drift: bool = False
     short_model_names: bool = False
     model_map: Dict[str, str] = field(default_factory=dict)
@@ -704,11 +705,17 @@ class Reconciler:
             if age < cfg.remove_grace:
                 continue
             if cfg.keep_last_per_model and self._is_last_for_model(str(entry.get("model_id") or ""), url, actual):
-                if url not in self.ledger.warned:
-                    self.ledger.warned.add(url)
-                    LOG.warning("%s gone %.0fs but it is the last worker of model '%s'; keeping it",
-                                url, age, entry.get("model_id"))
-                continue
+                if cfg.keep_last_grace > 0 and age >= cfg.keep_last_grace:
+                    LOG.warning("%s is the last worker of model '%s' but has been gone %.0fs "
+                                "(>= keep-last-grace %.0fs); removing it so the model goes "
+                                "away cleanly instead of serving 5xx",
+                                url, entry.get("model_id"), age, cfg.keep_last_grace)
+                else:
+                    if url not in self.ledger.warned:
+                        self.ledger.warned.add(url)
+                        LOG.warning("%s gone %.0fs but it is the last worker of model '%s'; keeping it",
+                                    url, age, entry.get("model_id"))
+                    continue
             self._remove(url, entry, age)
 
         self.ledger.save()
@@ -1059,6 +1066,9 @@ def build_arg_parser():
                    default=_env_bool("KEEP_LAST", True),
                    help="never remove the last worker of a model, --no-keep-last to override "
                         "[$LLM_WATCHER_KEEP_LAST]")
+    p.add_argument("--keep-last-grace", type=float, default=_env_float("KEEP_LAST_GRACE", 1800.0),
+                   help="seconds the last-worker protection lasts before a dead worker is "
+                        "removed anyway; 0 keeps it forever [$LLM_WATCHER_KEEP_LAST_GRACE]")
     p.add_argument("--fix-model-drift", action="store_true",
                    help="recycle a worker whose served model id changed on the same URL")
     p.add_argument("--short-model-names", dest="short_model_names",
@@ -1115,6 +1125,7 @@ def main(argv=None):
         allow_remove=args.allow_remove,
         remove_grace=args.remove_grace,
         keep_last_per_model=args.keep_last,
+        keep_last_grace=args.keep_last_grace,
         fix_model_drift=args.fix_model_drift,
         short_model_names=args.short_model_names,
         model_map=parse_model_map(

@@ -10,6 +10,7 @@ in-process on 127.0.0.1 ephemeral ports.
 import json
 import os
 import sys
+import time
 import tempfile
 import threading
 import unittest.mock
@@ -500,6 +501,46 @@ class TestReconcile(WatcherTestCase):
         srv.stop()
         rec.reconcile()
         self.assertEqual(len(router.deleted), 1)
+
+    def test_keep_last_protection_expires_and_removes_the_dead_worker(self):
+        # keep-last must not preserve a permanently-dead worker forever: once the
+        # outage outlives --keep-last-grace it is removed like any other one.
+        srv = self.server(models=["solo"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, keep_last_per_model=True,
+                              keep_last_grace=120.0)
+        rec.reconcile()
+        srv.stop()
+        # still inside the keep-last window -> protected
+        rec.ledger.missing_since[srv.url] = time.time() - 60
+        rec.reconcile()
+        self.assertEqual(router.deleted, [])
+        # outage outlived the keep-last window -> removed, model leaves the pool
+        rec.ledger.missing_since[srv.url] = time.time() - 121
+        rec.reconcile()
+        self.assertEqual(len(router.deleted), 1)
+        self.assertNotIn(srv.url, rec.ledger.owned)
+
+    def test_keep_last_grace_zero_keeps_forever(self):
+        srv = self.server(models=["solo"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, keep_last_per_model=True,
+                              keep_last_grace=0.0)
+        rec.reconcile()
+        srv.stop()
+        rec.ledger.missing_since[srv.url] = time.time() - 999999
+        rec.reconcile()
+        self.assertEqual(router.deleted, [])
+
+    def test_worker_back_before_expiry_is_untouched(self):
+        srv = self.server(models=["solo"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router, keep_last_grace=120.0)
+        rec.reconcile()
+        rec.ledger.missing_since[srv.url] = time.time() - 100000   # stale bookkeeping
+        rec.reconcile()                                            # worker still there
+        self.assertEqual(router.deleted, [])
+        self.assertNotIn(srv.url, rec.ledger.missing_since)
 
     def test_stuck_add_releases_the_url(self):
         class StuckRouter(FakeRouter):
