@@ -339,6 +339,20 @@ def local_candidates(deny):
     return cands
 
 
+_skip_notes: Dict[str, float] = {}
+
+
+def _note_skip(url, reason, interval=3600.0):
+    """Log a repeated discovery rejection once, then only every `interval`."""
+    now = time.time()
+    last = _skip_notes.get(url + "|" + reason)
+    if last is None or now - last >= interval:
+        _skip_notes[url + "|" + reason] = now
+        LOG.info("Skipping %s: %s", url, reason)
+    else:
+        LOG.debug("Skipping %s: %s", url, reason)
+
+
 def probe_worker(url, timeout=3.0, require_health=False, max_models=0, allow_models_only=False):
     """Return WorkerInfo when url really is an OpenAI-compatible inference server."""
     status, payload, raw = http_json(url + "/v1/models", timeout=timeout)
@@ -402,9 +416,9 @@ def probe_worker(url, timeout=3.0, require_health=False, max_models=0, allow_mod
     # and /metrics -- a gateway refusing to forward -- is treated as a proxy signal.
     proxyish = st_health >= 500 and st_met >= 500
     if engine == "openai" and proxyish and not allow_models_only:
-        LOG.info("Skipping %s: /v1/models answers but /health and /metrics both 5xx -- "
-                 "an upstream/gateway, not a worker (exclude it, or pass "
-                 "--allow-models-only to register it anyway)", url)
+        _note_skip(url, "/v1/models answers but /health and /metrics both 5xx -- an "
+                   "upstream/gateway, not a worker (exclude it, or pass "
+                   "--allow-models-only to register it anyway)")
         return None
     return WorkerInfo(url=url, models=ids, engine=engine, has_health=has_health)
 

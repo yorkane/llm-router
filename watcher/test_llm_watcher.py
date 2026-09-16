@@ -382,6 +382,15 @@ class TestProbe(WatcherTestCase):
         self.assertIsNone(W.probe_worker(srv.url))
         self.assertIsNotNone(W.probe_worker(srv.url, allow_models_only=True))
 
+    def test_rejected_gateway_is_logged_once_not_every_pass(self):
+        srv = self.server(down=("/health", "/metrics"))
+        W._skip_notes.clear()
+        with unittest.mock.patch.object(W.LOG, "info") as info:
+            for _ in range(10):
+                self.assertIsNone(W.probe_worker(srv.url))
+        messages = [c for c in info.call_args_list if "Skipping" in str(c)]
+        self.assertEqual(len(messages), 1)
+
     def test_plain_engine_without_endpoints_is_still_a_worker(self):
         # 404 means "engine has no such endpoint", not "proxy": must still register.
         srv = self.server(health=False)
