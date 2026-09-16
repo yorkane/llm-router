@@ -321,7 +321,7 @@ impl Router {
         // mask "200-then-broken" workers — every request would tick a
         // success before the stream had a chance to error out.
         if !is_stream {
-            worker.record_outcome(status.is_success());
+            worker.record_outcome(!breaker_failed(status));
         }
 
         // Record worker errors for server errors (5xx)
@@ -632,7 +632,7 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            if breaker_failed(status) {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
@@ -668,6 +668,20 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
+}
+
+/// Local patch: should this response trip the worker's circuit breaker?
+///
+/// Upstream counts every non-2xx as a worker failure, so a client hammering the
+/// router with one bad request (over-context, malformed args -> 400) opens the
+/// breaker for healthy workers and everyone else gets 503. The P/D router
+/// already treats 4xx as "worker alive"; mirror that here, keeping 408/429 as
+/// real overload signals.
+fn breaker_failed(status: StatusCode) -> bool {
+    !(status.is_success()
+        || (status.is_client_error()
+            && status != StatusCode::REQUEST_TIMEOUT
+            && status != StatusCode::TOO_MANY_REQUESTS))
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {

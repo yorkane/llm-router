@@ -88,6 +88,40 @@ PYEOF
 # keep the existing lockfile; cargo refreshes it if deps changed
 [ -f "$GATEWAY/Cargo.lock" ] && cp "$GATEWAY/Cargo.lock" "$STAGE/Cargo.lock"
 
+# --- local patch: 4xx must not trip the circuit breaker (router.rs) ----------
+python3 - "$STAGE/src/routers/http/router.rs" <<'PYEOF'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+fn = """/// Local patch: should this response trip the worker's circuit breaker?
+///
+/// Upstream counts every non-2xx as a worker failure, so a client hammering the
+/// router with one bad request (over-context, malformed args -> 400) opens the
+/// breaker for healthy workers and everyone else gets 503. The P/D router
+/// already treats 4xx as "worker alive"; mirror that here, keeping 408/429 as
+/// real overload signals.
+fn breaker_failed(status: StatusCode) -> bool {
+    !(status.is_success()
+        || (status.is_client_error()
+            && status != StatusCode::REQUEST_TIMEOUT
+            && status != StatusCode::TOO_MANY_REQUESTS))
+}
+
+"""
+hits = 0
+a = "            worker.record_outcome(status.is_success());\n"
+if t.count(a) != 1: sys.exit("router.rs patch anchor 1 not unique: %d" % t.count(a))
+t = t.replace(a, "            worker.record_outcome(!breaker_failed(status));\n"); hits += 1
+b = "            if !status.is_success() {\n                tracked.mark_errored();"
+if t.count(b) != 1: sys.exit("router.rs patch anchor 2 not unique: %d" % t.count(b))
+t = t.replace(b, "            if breaker_failed(status) {\n                tracked.mark_errored();"); hits += 1
+c = "fn convert_reqwest_error(e: reqwest::Error) -> Response {"
+if t.count(c) != 1: sys.exit("router.rs patch anchor 3 not unique: %d" % t.count(c))
+t = t.replace(c, fn + c); hits += 1
+open(p, "w").write(t)
+print("[upstream-sync] router.rs breaker patch applied (%d edits)" % hits)
+PYEOF
+
 # --- apply into the repo ---
 rsync -a --delete --exclude=.upstream-ref "$STAGE/" "$GATEWAY/"
 echo "$TARGET_REF" > "$REF_FILE"
