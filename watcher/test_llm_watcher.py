@@ -29,12 +29,20 @@ class FakeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address):
+        # The "hang like a dead engine" mode closes the socket mid-request, which makes
+        # socketserver print a traceback per probe. That noise is the test, not a bug.
+        try:
+            request.close()
+        except Exception:
+            pass
+
 
 class Endpoint:
     """Minimal OpenAI-ish server: models list, optional /health, optional engine hints."""
 
     def __init__(self, models=("m1",), health=True, extra=None, html_instead=False,
-                 raw=None, down=()):
+                 raw=None, down=(), chat="ok"):
         self.models = list(models)
         self.health = health
         self.extra = extra or {}
@@ -42,6 +50,11 @@ class Endpoint:
         self.html_instead = html_instead
         self.raw = raw or {}          # path -> (content_type, body) verbatim answers
         self.calls = []
+        # What POST /v1/chat/completions does: "ok" generates, "refuse" drops the connection
+        # like a dead engine, "500" errors, "none" has no such endpoint (404) the way a plain
+        # engine does, "hang" accepts the socket and never answers.
+        self.chat = chat
+        self.chats = 0
         srv = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -99,8 +112,36 @@ class Endpoint:
                 else:
                     self._json({"error": "not found"}, 404)
 
-        FakeServer.__init__  # silence linters
-        self._http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            def do_POST(self):
+                path = self.path.split("?")[0]
+                srv.calls.append(path)
+                try:
+                    n = int(self.headers.get("content-length") or 0)
+                    if n:
+                        self.rfile.read(n)
+                except Exception:
+                    pass
+                if path != "/v1/chat/completions":
+                    self._json({"error": "not found"}, 404)
+                    return
+                srv.chats += 1
+                if srv.chat == "none":
+                    self._json({"error": "not found"}, 404)
+                elif srv.chat == "refuse":
+                    self.close_connection = True
+                    try:
+                        self.wfile.close()
+                    except Exception:
+                        pass
+                elif srv.chat == "500":
+                    self._json({"error": "model load failed"}, 500)
+                elif srv.chat == "hang":
+                    threading.Event().wait(30)      # outlives the probe's own timeout
+                    self._json({"choices": []})
+                else:
+                    self._json({"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        self._http = FakeServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self._http.serve_forever, daemon=True).start()
 
     @property
@@ -893,6 +934,237 @@ class TestModelMap(WatcherTestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+
+# --------------------------------------------------------------------------------------
+# Activity probing: a worker that answers /v1/models but no longer generates must not keep
+# its model advertised in the pool.
+# --------------------------------------------------------------------------------------
+class TestActivity(WatcherTestCase):
+    def _fast(self, **over):
+        over.setdefault("activity_interval", 0.0)     # probe every pass
+        over.setdefault("activity_timeout", 2.0)
+        return over
+
+    def test_unresponsive_worker_is_evicted_while_replica_healthy(self):
+        sick = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([sick.url, mate.url], router, **self._fast())
+        for _ in range(6):
+            rec.reconcile()
+        self.assertNotIn(sick.url, router.pool)
+        self.assertIn(mate.url, router.pool)
+        self.assertEqual(rec.stats["activity_removes"], 1)
+
+    def test_fewer_failures_than_the_threshold_keep_the_worker(self):
+        sick = self.server(models=["dup"], chat="500")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([sick.url, mate.url], router,
+                              **self._fast(activity_fail_threshold=99))
+        for _ in range(5):
+            rec.reconcile()
+        self.assertIn(sick.url, router.pool)
+        self.assertEqual(router.deleted, [])
+
+    def test_engine_without_a_chat_endpoint_is_never_evicted(self):
+        plain = self.server(models=["dup"], chat="none")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([plain.url, mate.url], router, **self._fast())
+        for _ in range(6):
+            rec.reconcile()
+        self.assertIn(plain.url, router.pool)
+        self.assertEqual(router.deleted, [])
+
+    def test_last_unresponsive_worker_waits_for_the_keep_last_grace(self):
+        only = self.server(models=["solo"], chat="refuse")
+        router = FakeRouter()
+        rec = self.reconciler([only.url], router, **self._fast())
+        for _ in range(6):
+            rec.reconcile()
+        self.assertEqual(router.deleted, [])
+        self.assertIn(only.url, router.pool)
+        self.assertIn(only.url, rec.ledger.unresponsive_since)
+
+    def test_last_unresponsive_worker_goes_when_keep_last_is_off(self):
+        only = self.server(models=["solo"], chat="refuse")
+        router = FakeRouter()
+        rec = self.reconciler([only.url], router, **self._fast(keep_last_per_model=False))
+        for _ in range(6):
+            rec.reconcile()
+        self.assertNotIn(only.url, router.pool)
+
+    def test_last_unresponsive_worker_goes_once_the_grace_expires(self):
+        only = self.server(models=["solo"], chat="refuse")
+        router = FakeRouter()
+        rec = self.reconciler([only.url], router, **self._fast(keep_last_grace=0.001))
+        for _ in range(6):
+            rec.reconcile()
+        self.assertNotIn(only.url, router.pool)
+
+    def test_evicting_an_unresponsive_worker_stops_it_coming_back(self):
+        sick = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([sick.url, mate.url],
+                              router, **self._fast(activity_interval=60.0))
+        rec.reconcile()                       # registers both
+        rec._acts[sick.url] = {"n": 9, "next": 0.0}
+        rec.reconcile()                       # evicted
+        self.assertNotIn(sick.url, router.pool)
+        adds = len(router.added)
+        rec._acts[sick.url] = {"n": 9, "next": 0.0}
+        rec.reconcile()
+        self.assertEqual(len(router.added), adds)   # still in the re-add back-off
+
+    def test_protected_worker_is_evicted_when_it_stops_generating(self):
+        # The --worker-urls case: those are never removed for disappearing, which is exactly
+        # how a stopped model lingers in /v1/models forever on 21.k.
+        dead = self.server(models=["human-model"], chat="refuse")
+        mate = self.server(models=["human-model"])
+        router = FakeRouter(pool={
+            dead.url: {"id": "w-h", "url": dead.url, "model_id": "human-model", "is_healthy": True},
+            mate.url: {"id": "w-m", "url": mate.url, "model_id": "human-model", "is_healthy": True},
+        })
+        rec = self.reconciler([dead.url, mate.url], router, **self._fast())
+        for _ in range(6):
+            rec.reconcile()
+        self.assertNotIn(dead.url, rec.ledger.protected)   # evicting hands ownership over
+        self.assertIn(mate.url, rec.ledger.protected)      # untouched peers stay protected
+        self.assertEqual(router.added, [])                 # nothing gets re-added while sick
+        self.assertNotIn(dead.url, router.pool)
+        self.assertIn("w-h", router.deleted)
+
+    def test_activity_probe_off_never_touches_chat(self):
+        srv = self.server(models=["dup"])
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url, mate.url], router, **self._fast(activity_probe=False))
+        for _ in range(6):
+            rec.reconcile()
+        self.assertEqual(srv.chats, 0)
+        self.assertIn(srv.url, router.pool)
+
+    def test_allow_remove_false_only_warns(self):
+        sick = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([sick.url, mate.url], router,
+                              **self._fast(allow_remove=False))
+        for _ in range(6):
+            rec.reconcile()
+        self.assertEqual(router.deleted, [])
+        self.assertIn(sick.url, router.pool)
+
+    def test_recovery_clears_the_strikes(self):
+        srv = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([srv.url, mate.url], router,
+                              **self._fast(activity_fail_threshold=3))
+        # The first pass registers (the pool snapshot predates the add), the second only
+        # schedules the probe, so strikes start on pass three.
+        for _ in range(3):
+            rec.reconcile()
+        self.assertEqual(rec._acts[srv.url]["n"], 1)     # one strike, still short of 3
+        srv.chat = "ok"
+        rec.reconcile()
+        self.assertEqual(rec._acts[srv.url]["n"], 0)
+        self.assertIn(srv.url, router.pool)
+        self.assertEqual(router.deleted, [])
+
+    def test_router_outage_skips_the_activity_pass(self):
+        sick = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([sick.url, mate.url], router,
+                              **self._fast(activity_fail_threshold=1))
+        rec.reconcile()
+        router.health = lambda: False
+        for _ in range(4):
+            rec.reconcile()
+        self.assertEqual(router.deleted, [])
+        self.assertIn(sick.url, router.pool)
+
+    def test_dry_run_evicts_nothing_and_writes_no_ledger(self):
+        sick = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        state = os.path.join(self._tmp, "state-dry")
+        cfg = make_cfg(state, [sick.url, mate.url], dry_run=True,
+                       **self._fast(activity_fail_threshold=1))
+        rec = W.Reconciler(cfg)
+        rec.router = router
+        for _ in range(4):
+            rec.reconcile()
+        self.assertEqual(router.deleted, [])
+        self.assertEqual(router.added, [])               # dry-run registers nothing at all
+        self.assertFalse(os.path.exists(os.path.join(state, "ledger.json")))
+
+    def test_busy_worker_survives_many_slow_probes(self):
+        busy = self.server(models=["dup"], chat="hang")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([busy.url, mate.url], router,
+                              **self._fast(activity_timeout=1.0, activity_fail_threshold=1,
+                                           activity_slow_factor=99))
+        for _ in range(5):
+            rec.reconcile()
+        self.assertGreaterEqual(rec._acts[busy.url]["n"], 2)   # slow probes do accumulate
+        self.assertIn(busy.url, router.pool)
+        self.assertEqual(router.deleted, [])
+
+    def test_worker_that_never_answers_is_still_evicted(self):
+        # A process that only accepts sockets and never replies is the other way a model rots
+        # in the pool, so timeouts must stay finite -- just much stricter than a 5xx.
+        hung = self.server(models=["dup"], chat="hang")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([hung.url, mate.url], router,
+                              **self._fast(activity_timeout=0.5, activity_fail_threshold=1,
+                                           activity_slow_factor=2))
+        for _ in range(10):
+            rec.reconcile()
+        self.assertNotIn(hung.url, router.pool)
+
+    def test_healing_static_worker_is_re_added_after_takeover(self):
+        # A --worker-urls worker that was evicted must not be stranded: protected URLs are
+        # never re-added, so eviction hands ownership over to the watcher.
+        srv = self.server(models=["human-model"], chat="refuse")
+        mate = self.server(models=["human-model"])      # healthy replica: not a keep-last case
+        router = FakeRouter(pool={
+            srv.url: {"id": "w-h", "url": srv.url, "model_id": "human-model", "is_healthy": True},
+        })
+        rec = self.reconciler([srv.url, mate.url], router, **self._fast())
+        for _ in range(6):
+            rec.reconcile()
+        self.assertNotIn(srv.url, router.pool)
+        self.assertNotIn(srv.url, rec.ledger.protected)      # ownership handed over
+        srv.chat = "ok"
+        rec._add_fails[srv.url]["until"] = 0.0               # re-add back-off expired
+        for _ in range(3):
+            rec.reconcile()
+        self.assertIn(srv.url, router.pool)
+        self.assertIn(srv.url, rec.ledger.owned)
+
+    def test_activity_flags_parse_from_environment(self):
+        os.environ["LLM_WATCHER_ACTIVITY_INTERVAL"] = "90"
+        os.environ["LLM_WATCHER_ACTIVITY_FAIL_THRESHOLD"] = "5"
+        os.environ["LLM_WATCHER_ACTIVITY_PROTECTED"] = "false"
+        os.environ["LLM_WATCHER_ACTIVITY_SLOW_FACTOR"] = "7"
+        try:
+            args = W.build_arg_parser().parse_args([])
+        finally:
+            for key in ("LLM_WATCHER_ACTIVITY_INTERVAL", "LLM_WATCHER_ACTIVITY_FAIL_THRESHOLD",
+                        "LLM_WATCHER_ACTIVITY_PROTECTED", "LLM_WATCHER_ACTIVITY_SLOW_FACTOR"):
+                del os.environ[key]
+        self.assertEqual(args.activity_interval, 90.0)
+        self.assertEqual(args.activity_fail_threshold, 5)
+        self.assertFalse(args.activity_protected)
+        self.assertEqual(args.activity_slow_factor, 7)
 
 
 if __name__ == "__main__":

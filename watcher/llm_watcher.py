@@ -423,6 +423,48 @@ def probe_worker(url, timeout=3.0, require_health=False, max_models=0, allow_mod
     return WorkerInfo(url=url, models=ids, engine=engine, has_health=has_health)
 
 
+def activity_probe(url, model_id, timeout=15.0, api_key=None):
+    """Ask the worker to actually generate one token -> "alive" | "dead" | "slow" | "unknown".
+
+    HTTP probing only proves a socket answers: llama.cpp keeps /v1/models alive after
+    the model is gone, and a worker registered with disable_health_check is never
+    checked by the router at all, so either one keeps its model listed in /v1/models
+    forever while every real request 5xx-es. One token of chat completion is the
+    cheapest signal that the engine can still do its job.
+
+    Deliberately conservative, because a false "dead" costs a working worker:
+      * connection refused, or a 5xx        -> dead   (process gone, or the engine says no)
+      * it simply did not answer in time    -> slow   -- a 262K-context worker deep in a
+        queue also does that, so it needs far more strikes than a 5xx (see
+        --activity-slow-factor)
+      * 404                                 -> unknown (no chat endpoint, or it rejects this
+        model id; the process answers, so do not judge it)
+      * anything else, including a 4xx the engine itself produced -> alive
+    """
+    import socket
+    body = json.dumps({"model": model_id, "messages": [{"role": "user", "content": "ping"}],
+                       "max_tokens": 1, "temperature": 0, "stream": False}).encode()
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    req = urllib.request.Request(url + "/v1/chat/completions", data=body,
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return "alive" if resp.status < 500 else "dead"
+    except urllib.error.HTTPError as exc:
+        return "unknown" if exc.code == 404 else ("dead" if exc.code >= 500 else "alive")
+    except (socket.timeout, TimeoutError):
+        return "slow"
+    except urllib.error.URLError as exc:
+        # urllib wraps both DNS/connection failures and the timeout in URLError.
+        return "slow" if isinstance(exc.reason, (socket.timeout, TimeoutError)) else "dead"
+    except OSError:
+        return "dead"      # connection refused, reset, unreachable
+    except Exception:
+        return "slow"      # nothing decisive; the gentlest verdict
+
+
 class RouterClient:
     def __init__(self, base_url, api_key=None, timeout=5.0):
         self.base = normalize_url(base_url)
@@ -506,6 +548,10 @@ class Ledger:
         self.protected: Set[str] = set()
         self.owned: Dict[str, dict] = {}
         self.missing_since: Dict[str, float] = {}
+        # url -> when it last failed to generate. Separate from missing_since because the
+        # worker is still in the pool and still answers /v1/models; the keep-last grace has
+        # to be counted from when inference stopped, not from when the socket went quiet.
+        self.unresponsive_since: Dict[str, float] = {}
         self.warned: Set[str] = set()
         self.model_map: Dict[str, str] = {}
         self._load()
@@ -522,6 +568,8 @@ class Ledger:
         self.protected = {normalize_url(str(u)) for u in data.get("protected", [])}
         self.owned = {normalize_url(str(k)): v for k, v in (data.get("owned") or {}).items()}
         self.missing_since = {normalize_url(str(k)): float(v) for k, v in (data.get("missing_since") or {}).items()}
+        self.unresponsive_since = {normalize_url(str(k)): float(v)
+                                   for k, v in (data.get("unresponsive_since") or {}).items()}
         self.model_map = {str(k): str(v) for k, v in (data.get("model_map") or {}).items()}
         LOG.info("ledger loaded: %d owned, %d protected", len(self.owned), len(self.protected))
 
@@ -534,6 +582,7 @@ class Ledger:
             "protected": sorted(self.protected),
             "owned": self.owned,
             "missing_since": self.missing_since,
+            "unresponsive_since": self.unresponsive_since,
             "model_map": getattr(self, "model_map", {}),
             "updated_at": int(time.time()),
         }
@@ -568,6 +617,12 @@ class Config:
     remove_grace: float = 300.0
     keep_last_per_model: bool = True
     keep_last_grace: float = 1800.0
+    activity_probe: bool = True
+    activity_interval: float = 60.0
+    activity_timeout: float = 15.0
+    activity_fail_threshold: int = 3
+    activity_slow_factor: int = 3
+    activity_protected: bool = True
     fix_model_drift: bool = False
     short_model_names: bool = False
     model_map: Dict[str, str] = field(default_factory=dict)
@@ -594,7 +649,12 @@ class Reconciler:
         # answers /v1/models but is not a worker, so the job lands in "failed").
         # Retrying every pass just churns; back off exponentially instead.
         self._add_fails: Dict[str, dict] = {}
-        self.stats = {"reconciles": 0, "adds": 0, "removes": 0, "discovered": 0, "last_error": ""}
+        # url -> {"n": consecutive failed chat probes, "next": when to probe again}.
+        # In memory on purpose: after a watcher restart every worker gets a fresh set of
+        # strikes, which is the conservative direction (never delete on stale evidence).
+        self._acts: Dict[str, dict] = {}
+        self.stats = {"reconciles": 0, "adds": 0, "removes": 0, "discovered": 0,
+                      "activity_unresponsive": 0, "activity_removes": 0, "last_error": ""}
 
     def model_map(self) -> Dict[str, str]:
         """Current original-id -> public-id renames."""
@@ -681,6 +741,7 @@ class Reconciler:
     def reconcile(self):
         cfg = self.cfg
         self.stats["reconciles"] += 1
+        self.stats["activity_unresponsive"] = 0
         try:
             actual = self.router.list_workers()
         except Exception as exc:
@@ -758,6 +819,151 @@ class Reconciler:
 
         self.ledger.save()
         self._check_model_isolation(actual)
+        self._check_activity(actual)
+
+    # "Discovered" only means a socket answered /v1/models, and that outlives the model:
+    # llama.cpp keeps serving the model list after the weights are gone, and a worker added
+    # with disable_health_check is never probed by the router at all. The router drops a
+    # model from /v1/models only when its last worker entry is deleted, so a zombie
+    # registration keeps the model advertised while every request for it fails. Ask each
+    # pool member to generate one token, and evict the ones that stop doing it.
+    def _check_activity(self, actual):
+        cfg = self.cfg
+        if not cfg.activity_probe or not actual:
+            return
+        if not self.router.health():
+            # A router that is mid-restart explains every worker failing at once, and a
+            # DELETE would be answered with a 404 anyway. Skip the pass, keep the strikes.
+            LOG.debug("router /health unanswered; skipping activity pass")
+            return
+        now = time.time()
+        due: Dict[str, str] = {}
+        # Forget anything that left the pool; a worker that comes back starts with clean eyes.
+        for url in [u for u in self._acts if u not in actual]:
+            self._acts.pop(url, None)
+        for url in [u for u in self.ledger.unresponsive_since if u not in actual]:
+            self.ledger.unresponsive_since.pop(url, None)
+        for url, item in sorted(actual.items()):
+            if not cfg.activity_protected and url not in self.ledger.owned:
+                continue      # judge only what we registered, if protected workers are exempt
+            if not str(item.get("id") or ""):
+                continue      # nothing to delete, so nothing to decide about
+            model_id = str(item.get("model_id") or "")
+            if not model_id or model_id == "unknown":
+                continue      # cannot address the model, so cannot probe it
+            state = self._acts.get(url)
+            if state is None:
+                # Stagger the first probes by port so a pool of N workers does not mean N
+                # simultaneous chat requests at the same instant. Deterministic on purpose:
+                # a restart of the daemon then probes in the same order instead of racing.
+                port = urllib.parse.urlsplit(url).port or 0
+                self._acts[url] = {"n": 0,
+                                   "next": now + cfg.activity_interval * ((port % 97) / 97.0)}
+                continue
+            if state["next"] > now:
+                continue
+            due[url] = model_id
+        if not due:
+            return
+        for url, res in zip(due, self._probe_activity(due)):
+            self._note_activity(url, res, actual)
+
+    def _probe_activity(self, due: Dict[str, str]):
+        urls = list(due)
+        with ThreadPoolExecutor(max_workers=max(1, min(len(urls), self.cfg.workers))) as pool:
+            return list(pool.map(
+                lambda url: activity_probe(url, due[url], timeout=self.cfg.activity_timeout,
+                                           api_key=self.cfg.worker_api_key),
+                urls))
+
+    def _note_activity(self, url, result, actual):
+        cfg = self.cfg
+        state = self._acts.setdefault(url, {"n": 0, "next": 0.0})
+        state["next"] = time.time() + cfg.activity_interval
+        if result == "alive":
+            if state["n"]:
+                LOG.info("%s generates again after %d failed probe(s)", url, state["n"])
+            state["n"] = 0
+            self.ledger.unresponsive_since.pop(url, None)
+            self.ledger.warned.discard(url)
+            return
+        if result == "unknown":
+            _note_skip(url, "no usable /v1/chat/completions (404); judging it on HTTP probes only")
+            return
+        # A busy worker (big-context prefill, deep queue, cold reload) looks exactly like a
+        # hung one from here, so a timeout gets a much larger budget before it counts: a
+        # hard failure needs activity_fail_threshold probes, a timeout needs that times
+        # activity_slow_factor. Still finite, because a process that only accepts sockets and
+        # never answers is the other way a model rots in the pool, and that one must go too.
+        need = cfg.activity_fail_threshold * (cfg.activity_slow_factor if result == "slow" else 1)
+        state["n"] += 1
+        self.stats["activity_unresponsive"] += 1
+        item = actual.get(url) or {}
+        model_id = str(item.get("model_id") or "")
+        if state["n"] < need:
+            LOG.warning("%s did not answer a chat probe (%s, %d/%d); watching",
+                        url, result, state["n"], need)
+            return
+        why = "%d chat probes in a row went unanswered (last: %s)" % (state["n"], result)
+        if not cfg.allow_remove:
+            if url not in self.ledger.warned:
+                self.ledger.warned.add(url)
+                LOG.warning("%s is not generating (%s) but removal is disabled "
+                            "(--allow-remove false)", url, why)
+            return
+        if cfg.keep_last_per_model and self._is_last_for_model(model_id, url, actual):
+            # Same bounded grace as a vanished worker, timed from the first failed probe:
+            # a single-instance model is the common case here, and refusing forever to drop
+            # it is precisely how a dead model stays listed in /v1/models.
+            since = self.ledger.unresponsive_since.setdefault(url, time.time())
+            age = time.time() - since
+            if not (cfg.keep_last_grace > 0 and age >= cfg.keep_last_grace):
+                if url not in self.ledger.warned:
+                    self.ledger.warned.add(url)
+                    LOG.warning("%s is not generating (%s) but it is the last worker of model "
+                                "'%s'; keeping it for %.0fs more", url, why, model_id,
+                                max(0.0, cfg.keep_last_grace - age))
+                return
+            why += " and it is the last worker of model '%s' for %.0fs" % (model_id, age)
+        self._evict_unresponsive(url, item, why)
+
+    def _evict_unresponsive(self, url, item, why):
+        worker_id = str(item.get("id") or "")
+        if self.cfg.dry_run:
+            LOG.info("[dry-run] would REMOVE %s (%s)", url, why)
+            return
+        ok, detail = self.router.delete(worker_id)
+        if not ok:
+            self.stats["last_error"] = detail
+            LOG.error("REMOVE %s failed: %s", url, detail)
+            return
+        self.stats["removes"] += 1
+        self.stats["activity_removes"] += 1
+        self.ledger.owned.pop(url, None)
+        self.ledger.missing_since.pop(url, None)
+        self.ledger.unresponsive_since.pop(url, None)
+        self.ledger.warned.discard(url)
+        # A protected URL (from --worker-urls or added by hand) is one this daemon promised
+        # never to touch -- and correspondingly never to re-add. Having just deleted it, that
+        # promise is spent: without this the container could come back healthy and stay out of
+        # the pool forever, because protected URLs are excluded from the desired set. Handing
+        # ownership over means discovery re-adds it as ours the moment it generates again.
+        was_protected = url in self.ledger.protected
+        if was_protected:
+            self.ledger.protected.discard(url)
+        self._pending.pop(url, None)
+        self._acts.pop(url, None)
+        self.ledger.save()
+        # Hold off re-adding it: the container is often still up and stays discoverable,
+        # so without a pause the next pass would register the same sick worker again.
+        fail = self._add_fails.setdefault(url, {"n": 0, "until": 0.0})
+        fail["n"] += 1
+        # Growing, but capped: a worker that stays broken is retried every few minutes rather
+        # than every pass, and one that heals is back in rotation within that window.
+        fail["until"] = time.time() + min(900.0, max(60.0, self.cfg.activity_interval) * (2 ** (fail["n"] - 1)))
+        LOG.warning("REMOVED %s (model '%s'): %s%s", url, item.get("model_id"), why,
+                    "; it is now watcher-managed and will return once it generates again"
+                    if was_protected else "")
 
     # Measured against smg: in single-router mode the worker pick ignores the requested
     # model (router.rs sets effective_model_id = None unless IGW). Once the pool holds two
@@ -986,6 +1192,8 @@ def start_metrics(reconciler, port):
                 "llm_watcher_discovered_workers %d" % rec.stats["discovered"],
                 "llm_watcher_owned_workers %d" % len(rec.ledger.owned),
                 "llm_watcher_protected_workers %d" % len(rec.ledger.protected),
+                "llm_watcher_activity_unresponsive %d" % rec.stats["activity_unresponsive"],
+                "llm_watcher_activity_removes_total %d" % rec.stats["activity_removes"],
                 "llm_watcher_model_map_entries %d" % len(rec.cfg.model_map),
                 "llm_watcher_router_reachable %d" % (0 if rec.stats["last_error"] else 1),
             ]
@@ -1124,6 +1332,29 @@ def build_arg_parser():
     p.add_argument("--keep-last-grace", type=float, default=_env_float("KEEP_LAST_GRACE", 1800.0),
                    help="seconds the last-worker protection lasts before a dead worker is "
                         "removed anyway; 0 keeps it forever [$LLM_WATCHER_KEEP_LAST_GRACE]")
+    p.add_argument("--activity-probe", dest="activity_probe", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("ACTIVITY_PROBE", True),
+                   help="ask each pooled worker for one token of chat completion and evict the "
+                        "ones that stop generating, even while /v1/models still answers "
+                        "[$LLM_WATCHER_ACTIVITY_PROBE]")
+    p.add_argument("--activity-interval", type=float, default=_env_float("ACTIVITY_INTERVAL", 60.0),
+                   help="seconds between activity probes to one worker [$LLM_WATCHER_ACTIVITY_INTERVAL]")
+    p.add_argument("--activity-timeout", type=float, default=_env_float("ACTIVITY_TIMEOUT", 15.0),
+                   help="seconds to wait for a chat probe answer; keep it above a worker's cold "
+                        "model-load time [$LLM_WATCHER_ACTIVITY_TIMEOUT]")
+    p.add_argument("--activity-fail-threshold", type=int, default=_env_int("ACTIVITY_FAIL_THRESHOLD", 3),
+                   help="consecutive unanswered chat probes before eviction "
+                        "[$LLM_WATCHER_ACTIVITY_FAIL_THRESHOLD]")
+    p.add_argument("--activity-slow-factor", type=int, default=_env_int("ACTIVITY_SLOW_FACTOR", 3),
+                   help="multiply --activity-fail-threshold by this when probes time out rather "
+                        "than get refused, so a busy big-context worker is not mistaken for a "
+                        "dead one [$LLM_WATCHER_ACTIVITY_SLOW_FACTOR]")
+    p.add_argument("--activity-protected", dest="activity_protected",
+                   action=argparse.BooleanOptionalAction, default=_env_bool("ACTIVITY_PROTECTED", True),
+                   help="also activity-probe workers that were already in the pool when this watcher "
+                        "first ran (--worker-urls and hand-added ones). They are never deleted for "
+                        "disappearing, so without this their models are exactly the ones that linger "
+                        "in /v1/models forever [$LLM_WATCHER_ACTIVITY_PROTECTED]")
     p.add_argument("--fix-model-drift", action="store_true",
                    help="recycle a worker whose served model id changed on the same URL")
     p.add_argument("--short-model-names", dest="short_model_names",
@@ -1182,6 +1413,12 @@ def main(argv=None):
         remove_grace=args.remove_grace,
         keep_last_per_model=args.keep_last,
         keep_last_grace=args.keep_last_grace,
+        activity_probe=args.activity_probe,
+        activity_interval=args.activity_interval,
+        activity_timeout=args.activity_timeout,
+        activity_fail_threshold=max(1, args.activity_fail_threshold),
+        activity_slow_factor=max(1, args.activity_slow_factor),
+        activity_protected=args.activity_protected,
         fix_model_drift=args.fix_model_drift,
         short_model_names=args.short_model_names,
         model_map=parse_model_map(
