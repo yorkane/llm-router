@@ -70,7 +70,7 @@ services:
       retries: 3
 
   llm-watcher:
-    image: llm-watcher:dev
+    image: ghcr.io/yorkane/llm-watcher:latest
     container_name: llm-watcher
     network_mode: host
     restart: unless-stopped

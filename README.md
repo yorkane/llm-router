@@ -58,6 +58,9 @@ Full flag list: `docker run --rm --entrypoint smg ghcr.io/yorkane/llm-router:lat
 - `harmony/` — vendored [openai/harmony](https://github.com/openai/harmony) v0.0.4 (path dependency, so the build needs no GitHub access)
 - `Dockerfile` — runtime image (`ubuntu:24.04` + `libssl3`), copies the CI-built binary
 - `.github/workflows/build.yml` — builds `smg` with the `ci` profile and publishes `ghcr.io/yorkane/llm-router:latest`
+- `.github/workflows/build-watcher.yml` — publishes `ghcr.io/yorkane/llm-watcher:latest`. Reusable:
+  both publish paths call it, so one push ships gateway and watcher from the same commit.
+  Fire it alone with `gh workflow run build-watcher.yml` (~30s, no cargo).
 - `watcher/` — `llm-watcher`, a stdlib-only Python daemon that registers and retires workers through
   the router's `POST/DELETE /workers` API (no rebuild, no restart)
 - `.github/workflows/upstream-sync.yml` — weekly sync of the vendored gateway from upstream (build-verified, then auto-publishes the ghcr image)

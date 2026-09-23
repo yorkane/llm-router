@@ -4,7 +4,7 @@ Keeps local inference services (vLLM / sglang / llama.cpp / anything OpenAI-comp
 inside an [llm-router](../README.md) pool, so starting or killing a model no longer means
 editing `--worker-urls` and restarting the router.
 
-Single file, standard library only: no pip, no CUDA, no image of its own.
+Single file, standard library only: no pip, no CUDA. The image is the base plus that one file (~1MB over the base), built and published to ghcr by CI.
 
 ## How it works
 
@@ -75,13 +75,14 @@ namespace and discovery finds nothing:
 ```bash
 docker run -d --name llm-watcher --network host --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  -v /home/aigc/ChatGPT/llm-router/watcher:/opt/watcher:ro \
   -v /var/lib/llm-watcher:/var/lib/llm-watcher \
-  python:3.12-alpine python3 /opt/watcher/llm_watcher.py \
+  ghcr.io/yorkane/llm-watcher:latest \
     --router http://127.0.0.1:8800 --state-dir /var/lib/llm-watcher --metrics-port 9912
 ```
 
-Pull `python:3.12-alpine` through the ACR mirror instead of docker.io (see skill: acr-wasu).
+The image is published by `.github/workflows/build-watcher.yml` on every push that touches
+`watcher/`, so `docker pull` is the upgrade path; flags after the image name still reach the
+daemon. Where ghcr.io is unreachable, mirror it through ACR (see skill: acr-wasu).
 
 ## Flags that matter
 

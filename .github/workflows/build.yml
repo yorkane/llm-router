@@ -3,6 +3,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # Docs-only commits still need the watcher image, not an 8-minute cargo build.
+    paths-ignore:
+      - '**/*.md'
   workflow_dispatch: {}
 
 env:
