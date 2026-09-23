@@ -1,0 +1,51 @@
+name: build-watcher
+
+# llm-watcher is a stdlib-only Python daemon, so its image is a ~30s build.
+# Reusable (workflow_call): build-and-publish and upstream-sync call it so one
+# push publishes both images together. It can still be fired on its own with
+#   gh workflow run build-watcher.yml
+# Deliberately no push: trigger here - build.yml's watcher job already covers
+# every push to main, and a second trigger would build the same tag twice.
+on:
+  workflow_dispatch: {}
+  workflow_call: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: yorkane/llm-watcher
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: watcher
+          # The Dockerfile defaults BASE to the ACR mirror for the fleet's boxes;
+          # the runner reaches Docker Hub directly, so override it here.
+          build-args: BASE=python:3.12-alpine
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=watcher
+          cache-to: type=gha,scope=watcher,mode=max
+

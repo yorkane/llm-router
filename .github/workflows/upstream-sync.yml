@@ -99,3 +99,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Keep the watcher image version-aligned with the gateway it is deployed with.
+  watcher:
+    needs: publish
+    uses: ./.github/workflows/build-watcher.yml

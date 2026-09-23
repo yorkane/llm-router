@@ -65,3 +65,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The watcher daemon ships as its own image; its build is ~30s and lives in a
+  # reusable workflow so every publish path pushes both images in one run.
+  watcher:
+    needs: []
+    uses: ./.github/workflows/build-watcher.yml
