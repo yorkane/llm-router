@@ -2,6 +2,29 @@
 /// fetches for a model. Tries the backing worker's own /props first (real
 /// llama.cpp servers answer it), otherwise returns a minimal document so the
 /// UI can still select the model and chat through the router.
+/// The webui hides the thinking-effort picker unless /props advertises a chat template
+/// that mentions thinking knobs (`enable_thinking` / `reasoning_effort` / `<|im_start|>`).
+/// Engines behind the router (ninfer, vllm, sglang) answer /props without
+/// `chat_template` at all, so the probe always says "no thinking" and the picker never
+/// renders. Effort here is forwarded as a top-level OpenAI `reasoning_effort` by the UI
+/// patch (watcher/patch_ui_effort.sh) and rejected by the backend if unsupported, so the
+/// capability question is the router's to answer: advertise it when the worker did not.
+fn ui_props_with_thinking(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        let advertised = obj
+            .get("chat_template")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("reasoning_effort") || s.contains("enable_thinking"));
+        if !advertised {
+            obj.insert(
+                "chat_template".to_string(),
+                Value::String("{% if reasoning_effort %}router-advertised{% endif %}".to_string()),
+            );
+        }
+    }
+    value
+}
+
 async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
     let candidates: Vec<Arc<dyn Worker>> = state
         .context
@@ -30,6 +53,9 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
         if let Ok(resp) = req.send().await {
             if resp.status().is_success() {
                 if let Ok(body) = resp.text().await {
+                    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                        return Json(ui_props_with_thinking(value)).into_response();
+                    }
                     return (StatusCode::OK, [("content-type", "application/json")], body)
                         .into_response();
                 }
@@ -43,11 +69,11 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
             .and_then(|w| w.models().first().map(|m| m.id.clone()))
             .unwrap_or_else(|| "unknown".to_string())
     });
-    Json(json!({
+    Json(ui_props_with_thinking(json!({
         "model_path": model_path,
         "model_alias": null,
         "webui_version": "llm-router",
-    }))
+    })))
     .into_response()
 }
 
@@ -156,4 +182,3 @@ async fn v1_ui_unsupported() -> Response {
     )
         .into_response()
 }
-
