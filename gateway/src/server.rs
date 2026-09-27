@@ -162,6 +162,91 @@ async fn v1_ui_empty() -> Response {
     Json(Vec::<Value>::new()).into_response()
 }
 
+/// llama.cpp 的 webui 在收到 /props 之前，首条消息可能不带 model 字段（或为空串），
+/// IGW 对未知模型一律 503；这里从注册表取第一个 HTTP worker 的模型 id 兜底填充。
+fn default_ui_model(state: &Arc<AppState>) -> Option<String> {
+    state
+        .context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+        .find_map(|w| w.models().first().map(|m| m.id.clone()))
+}
+
+fn clean_ui_effort(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        match obj.get("reasoning_effort") {
+            Some(Value::String(s)) if s.is_empty() => {
+                obj.remove("reasoning_effort");
+            }
+            Some(Value::Null) => {
+                obj.remove("reasoning_effort");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn fill_default_model(state: &Arc<AppState>, value: &mut Value) {
+    let missing = match value.get("model") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        _ => false,
+    };
+    if missing {
+        if let (Some(obj), Some(model)) = (value.as_object_mut(), default_ui_model(state)) {
+            obj.insert("model".to_string(), Value::String(model));
+        }
+    }
+}
+
+async fn v1_ui_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(mut value): Json<Value>,
+) -> Response {
+    fill_default_model(&state, &mut value);
+    clean_ui_effort(&mut value);
+    let req: ChatCompletionRequest = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"message": format!("invalid chat request: {e}")}})),
+            )
+                .into_response();
+        }
+    };
+    state
+        .router
+        .route_chat(Some(&headers), &req, Some(&req.model))
+        .await
+}
+
+async fn v1_ui_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(mut value): Json<Value>,
+) -> Response {
+    fill_default_model(&state, &mut value);
+    clean_ui_effort(&mut value);
+    let req: CompletionRequest = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"message": format!("invalid completion request: {e}")}})),
+            )
+                .into_response();
+        }
+    };
+    state
+        .router
+        .route_completion(Some(&headers), &req, Some(&req.model))
+        .await
+}
+
 async fn v1_ui_unsupported() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -619,8 +704,8 @@ pub struct ServerConfig {
 /// Stream resume/control have no router-side equivalent and answer honestly.
 fn ui_api_routes(auth_config: AuthConfig) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/_ui/v1/chat/completions", post(v1_chat_completions))
-        .route("/_ui/v1/completions", post(v1_completions))
+        .route("/_ui/v1/chat/completions", post(v1_ui_chat_completions))
+        .route("/_ui/v1/completions", post(v1_ui_completions))
         .route("/_ui/v1/models", get(v1_models))
         .route("/_ui/props", get(v1_ui_props))
         .route("/_ui/slots", any(v1_ui_empty))
