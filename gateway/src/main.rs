@@ -194,6 +194,12 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
+    /// Serve the bundled llama.cpp chat webui under /_ui/ from this directory
+    /// (env: SMG_UI_DIR). The directory is the unpacked llama.cpp *-ui.tar.gz
+    /// payload; see ui/README.md. Disabled when unset.
+    #[arg(long, env = "SMG_UI_DIR", help_heading = "WebUI")]
+    ui_dir: Option<String>,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -1182,6 +1188,7 @@ impl CliArgs {
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             control_plane_auth,
             mesh_server_config,
+            ui_dir: self.ui_dir.clone(),
         }
     }
 }

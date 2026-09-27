@@ -1,0 +1,18 @@
+    // llama.cpp webui: static SPA under /_ui/ (exact /_ui/v1/* and /_ui/props
+    // API routes registered in build_app win over the nested wildcard).
+    let app = match config.ui_dir.as_deref() {
+        Some(dir) if !dir.is_empty() => {
+            if std::path::Path::new(dir).is_dir() {
+                info!("Serving llama.cpp webui at /_ui/ from {}", dir);
+                app.nest_service(
+                    "/_ui",
+                    tower_http::services::ServeDir::new(dir)
+                        .append_index_html_on_directories(true),
+                )
+            } else {
+                warn!("ui_dir {} does not exist; webui disabled", dir);
+                app
+            }
+        }
+        _ => app,
+    };

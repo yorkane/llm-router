@@ -2,3 +2,4 @@ gateway/target/
 artifact/
 *.whl
 __pycache__/
+.playwright-cli/

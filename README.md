@@ -99,6 +99,21 @@ its own health checks for short blips, and nothing is removed until it has been 
 `--remove-grace` (default 300s) and is not the last worker of its model. See
 [watcher/README.md](watcher/README.md) for the guard list and the flags.
 
+## Built-in web chat UI
+
+The router can serve the official llama.cpp chat webui under /_ui/ without touching the
+original /v1 entrypoints. Pass --ui-dir /usr/local/share/llama-ui (or set SMG_UI_DIR);
+the Docker image ships the bundle and enables it by default.
+
+Open http://ROUTER:8800/_ui/ and chat against any model the router knows. The UI calls
+/_ui/v1/chat/completions, /_ui/v1/models and /_ui/props, which the router proxies through
+the same pipeline (auth, body limits, metrics, IGW model routing). /props is fetched from
+the upstream worker when it answers (real llama.cpp) and synthesized from router state
+otherwise, so non-llama workers still show up. The official UI bundle lives in ui/
+(path-patched by watcher/patch_ui.sh); watcher/patches/ui/ re-applies the Rust side after
+every upstream sync. llama.cpp control/stream endpoints answer 501, and the root path / is
+unchanged.
+
 ## Credits / license
 
 Derived from [sgl-project/sglang](https://github.com/sgl-project/sglang) (`sgl-model-gateway`, Apache-2.0)

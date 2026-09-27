@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -10,7 +11,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use rustls::crypto::ring;
@@ -29,7 +30,7 @@ use crate::{
     core::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{TokenizerConfigRequest, WorkflowEngines},
-        worker::WorkerType,
+        worker::{ConnectionMode, Worker, WorkerType},
         worker_manager::WorkerManager,
         Job,
     },
@@ -93,6 +94,80 @@ async fn parse_reasoning(
 
 async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// llama.cpp webui (/_ui/) support: synthesize the /props document the UI
+/// fetches for a model. Tries the backing worker's own /props first (real
+/// llama.cpp servers answer it), otherwise returns a minimal document so the
+/// UI can still select the model and chat through the router.
+async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
+    let candidates: Vec<Arc<dyn Worker>> = state
+        .context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+        .filter(|w| {
+            wanted.is_none()
+                || w.models()
+                    .iter()
+                    .any(|m| Some(&m.id) == wanted.as_ref())
+        })
+        .collect();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+    for w in &candidates {
+        let url = format!("{}/props", w.url().trim_end_matches('/'));
+        let mut req = client.get(&url);
+        if let Some(key) = w.api_key().as_deref() {
+            req = req.bearer_auth(key);
+        }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.text().await {
+                    return (StatusCode::OK, [("content-type", "application/json")], body)
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    let model_path = wanted.unwrap_or_else(|| {
+        candidates
+            .first()
+            .and_then(|w| w.models().first().map(|m| m.id.clone()))
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    Json(json!({
+        "model_path": model_path,
+        "model_alias": null,
+        "webui_version": "llm-router",
+    }))
+    .into_response()
+}
+
+async fn v1_ui_props(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    ui_props(&state, params.get("model").cloned()).await
+}
+
+/// The webui polls /slots and /v1/streams/lookup to resume in-flight llama.cpp
+/// server streams; the router does not own those, so report "nothing pending".
+async fn v1_ui_empty() -> Response {
+    Json(Vec::<Value>::new()).into_response()
+}
+
+async fn v1_ui_unsupported() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "llama.cpp server stream/control not available through the router"})),
+    )
+        .into_response()
 }
 
 async fn liveness() -> Response {
@@ -531,6 +606,32 @@ pub struct ServerConfig {
     /// Control plane authentication configuration
     pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
+    /// Directory holding the unpacked llama.cpp webui assets; when set, they
+    /// are served under /_ui/ together with the API aliases the UI needs.
+    pub ui_dir: Option<String>,
+}
+
+/// API aliases for the llama.cpp webui served under /_ui/.
+///
+/// The bundled UI is patched (watcher/patch_ui.sh) to call /_ui/v1/... and
+/// /_ui/props; map those back onto the regular handlers so the UI chats
+/// through the same router pipeline (auth, body limit, metrics included).
+/// Stream resume/control have no router-side equivalent and answer honestly.
+fn ui_api_routes(auth_config: AuthConfig) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/_ui/v1/chat/completions", post(v1_chat_completions))
+        .route("/_ui/v1/completions", post(v1_completions))
+        .route("/_ui/v1/models", get(v1_models))
+        .route("/_ui/props", get(v1_ui_props))
+        .route("/_ui/slots", any(v1_ui_empty))
+        .route("/_ui/v1/streams/lookup", any(v1_ui_empty))
+        .route("/_ui/tools", any(v1_ui_empty))
+        .route("/_ui/v1/chat/completions/control", any(v1_ui_unsupported))
+        .route("/_ui/v1/stream", any(v1_ui_unsupported))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            middleware::auth_middleware,
+        ))
 }
 
 pub fn build_app(
@@ -676,6 +777,7 @@ pub fn build_app(
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
+        .merge(ui_api_routes(auth_config.clone()))
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
@@ -1046,6 +1148,25 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
     );
+
+    // llama.cpp webui: static SPA under /_ui/ (exact /_ui/v1/* and /_ui/props
+    // API routes registered in build_app win over the nested wildcard).
+    let app = match config.ui_dir.as_deref() {
+        Some(dir) if !dir.is_empty() => {
+            if std::path::Path::new(dir).is_dir() {
+                info!("Serving llama.cpp webui at /_ui/ from {}", dir);
+                app.nest_service(
+                    "/_ui",
+                    tower_http::services::ServeDir::new(dir)
+                        .append_index_html_on_directories(true),
+                )
+            } else {
+                warn!("ui_dir {} does not exist; webui disabled", dir);
+                app
+            }
+        }
+        _ => app,
+    };
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);

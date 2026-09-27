@@ -1,0 +1,22 @@
+/// API aliases for the llama.cpp webui served under /_ui/.
+///
+/// The bundled UI is patched (watcher/patch_ui.sh) to call /_ui/v1/... and
+/// /_ui/props; map those back onto the regular handlers so the UI chats
+/// through the same router pipeline (auth, body limit, metrics included).
+/// Stream resume/control have no router-side equivalent and answer honestly.
+fn ui_api_routes(auth_config: AuthConfig) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/_ui/v1/chat/completions", post(v1_chat_completions))
+        .route("/_ui/v1/completions", post(v1_completions))
+        .route("/_ui/v1/models", get(v1_models))
+        .route("/_ui/props", get(v1_ui_props))
+        .route("/_ui/slots", any(v1_ui_empty))
+        .route("/_ui/v1/streams/lookup", any(v1_ui_empty))
+        .route("/_ui/tools", any(v1_ui_empty))
+        .route("/_ui/v1/chat/completions/control", any(v1_ui_unsupported))
+        .route("/_ui/v1/stream", any(v1_ui_unsupported))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            middleware::auth_middleware,
+        ))
+}

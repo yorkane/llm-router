@@ -124,6 +124,9 @@ PYEOF
 
 # --- apply into the repo ---
 rsync -a --delete --exclude=.upstream-ref "$STAGE/" "$GATEWAY/"
+
+# --- local patch: llama.cpp webui mount (--ui-dir, /_ui routes) -----------
+python3 "$ROOT/watcher/patches/ui/apply_ui.py" "$GATEWAY" "$ROOT/watcher/patches/ui"
 echo "$TARGET_REF" > "$REF_FILE"
 log "gateway/ updated to upstream $TARGET_REF"
 
