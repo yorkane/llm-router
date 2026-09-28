@@ -123,6 +123,37 @@ fn ui_props_with_thinking(mut value: Value) -> Value {
     value
 }
 
+/// Tell the webui it is behind a router (role:"router"): the header then shows
+/// the multi-model picker instead of the single-model view. No bundle patch is
+/// needed: the picker's list/load/sse/unload requests go through the SvelteKit
+/// base (which is /_ui when the page is served from /_ui/), so they land on the
+/// aliases below as /_ui/v1/models and /_ui/models/....
+///
+/// Every model behind this router is already served by a registered worker, so
+/// load/unload are no-ops that just confirm — the picker is a switcher, not a
+/// loader — and /_ui/models/sse stays silent. Set LMR_UI_ROUTER_MODE=false to
+/// go back to single-model presentation (e.g. for a llama.cpp instance whose
+/// UI expects to load GGUF files itself).
+fn ui_router_mode() -> bool {
+    std::env::var("LMR_UI_ROUTER_MODE")
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            !(v == "false" || v == "0" || v == "off")
+        })
+        .unwrap_or(true)
+}
+
+fn ui_props_with_role(mut value: Value) -> Value {
+    if ui_router_mode() {
+        if let Some(obj) = value.as_object_mut() {
+            // Force it: a llama.cpp worker answering /props says role:"model",
+            // but the *gateway* is the thing the UI is talking to.
+            obj.insert("role".to_string(), Value::String("router".to_string()));
+        }
+    }
+    value
+}
+
 /// Report the configured context cap instead of the worker's raw n_ctx when the
 /// Config page set one, so the webui's context slider cannot offer more than
 /// the router will actually forward (apply_ctx_cap clamps the request too).
@@ -177,7 +208,7 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
                 if let Ok(body) = resp.text().await {
                     if let Ok(value) = serde_json::from_str::<Value>(&body) {
                         return Json(ui_props_with_ctx(
-                            ui_props_with_thinking(value),
+                            ui_props_with_role(ui_props_with_thinking(value)),
                             cap_model.as_deref(),
                         ))
                         .into_response();
@@ -196,11 +227,11 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
             .unwrap_or_else(|| "unknown".to_string())
     });
     Json(ui_props_with_ctx(
-        ui_props_with_thinking(json!({
+        ui_props_with_role(ui_props_with_thinking(json!({
             "model_path": model_path,
             "model_alias": null,
             "webui_version": "llm-router",
-        })),
+        }))),
         cap_model.as_deref(),
     ))
     .into_response()
@@ -387,6 +418,62 @@ async fn ui_logs_stream() -> Response {
             KeepAlive::new().interval(Duration::from_secs(15))
                 .text("ping"),
         )
+        .into_response()
+}
+
+// ============================================================================
+// Router-mode model endpoints for the llama.cpp webui: /_ui/v1/models,
+// /_ui/models/{load,sse,unload}
+//
+// role:"router" in /props switches the UI to its multi-model picker, which
+// reads the model list and streams status from these paths. Every model here
+// is already served by a registered worker, so the picker is a switcher:
+// load is an immediate success, the status stream stays silent, and
+// unload refuses (unloading would take a whole instance out of the pool for
+// everybody else - that is the watcher's job, not the chat UI's).
+// ============================================================================
+
+async fn ui_models(State(state): State<Arc<AppState>>) -> Response {
+    let mut data: Vec<Value> = Vec::new();
+    for worker in state.context.worker_registry.get_all() {
+        for model in worker.models() {
+            let id = &model.id;
+            if data.iter().any(|m| m["id"].as_str() == Some(id.as_str())) {
+                continue;
+            }
+            data.push(json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "llm-router",
+                // the UI keys its picker (and whether it fetches per-model
+                // /props) off this field; everything registered is serving.
+                "status": {"value": "loaded"},
+            }));
+        }
+    }
+    Json(json!({"object": "list", "data": data})).into_response()
+}
+
+async fn ui_model_load() -> Response {
+    Json(json!({"success": true})).into_response()
+}
+
+async fn ui_model_unload() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {"message": "模型由 router 后的实例常驻提供，聊天界面不能卸载；要摘除请在 watcher / 服务侧操作"}})),
+    )
+        .into_response()
+}
+
+/// The stock UI polls this for load/unload progress. Nothing ever changes
+/// behind a router, so the stream exists only to keep the UI from retrying it
+/// every second - it never has to send a frame.
+async fn ui_models_sse() -> Response {
+    let stream = futures_util::stream::pending::<Result<Event, std::convert::Infallible>>();
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)).text("ping"))
         .into_response()
 }
 
@@ -929,7 +1016,13 @@ fn ui_api_routes(auth_config: AuthConfig) -> Router<Arc<AppState>> {
     Router::new()
         .route("/_ui/v1/chat/completions", post(v1_ui_chat_completions))
         .route("/_ui/v1/completions", post(v1_ui_completions))
-        .route("/_ui/v1/models", get(v1_models))
+        // Router-mode picker (role:"router" in /props). The SvelteKit base is
+        // /_ui, so the bundle's "/v1/models" and "/models/{load,sse,unload}"
+        // literals already arrive under /_ui/... — no bundle patch needed.
+        .route("/_ui/v1/models", get(ui_models))
+        .route("/_ui/models/load", post(ui_model_load))
+        .route("/_ui/models/unload", post(ui_model_unload))
+        .route("/_ui/models/sse", get(ui_models_sse))
         .route("/_ui/props", get(v1_ui_props))
         .route("/_ui/slots", any(v1_ui_empty))
         .route("/_ui/v1/streams/lookup", any(v1_ui_empty))
