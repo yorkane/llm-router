@@ -1,7 +1,7 @@
 /*
-  llm-router：在官方 llama.cpp webui（/_ui/）左侧导航里插入「Logs」「Config」两个入口。
+  llm-router：在官方 llama.cpp webui（/_ui/）左侧导航里注入单个 Logs 入口。
   由 index.html 以 <script src="./logs-inject.js" defer></script> 引入（见 watcher/patch_ui_logs.sh）。
-  单文件方案：两个按钮都由本文件注入（ENTRY 数组），index.html 只需一行注入，
+  单文件方案：按钮由本文件注入（ENTRY 数组），index.html 只需一行注入，
   官方 webui 升级后重跑 patch_ui_logs.sh 即可全部恢复。
 
   为什么需要 MutationObserver：导航容器（aside div[class*="px-2"][class*="flex-col"][class*="gap-1"]）
@@ -33,14 +33,9 @@
       ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide h-4 w-4">' +
       '<path d="M15 12h3v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>' +
       '<path d="m9 11 2 2 4-4"/></svg>';
-    var SVG_CONFIG = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"' +
-      ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide h-4 w-4">' +
-      '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>' +
-      '<circle cx="12" cy="12" r="3"/></svg>';
-    /* 注入项清单（顺序即导航顺序）：mark 为幂等标记值，href 用 baseURI 解析 */
+    /* 只注入 Logs 一项：Config 与 Metrics 通过 logs.html 顶部的共享标签条到达 */
     var ENTRIES = [
-      { mark: 'logs',   label: 'Logs',   icon: SVG_LOGS,   href: 'logs.html' },
-      { mark: 'config', label: 'Config', icon: SVG_CONFIG, href: 'config.html' }
+      { mark: 'logs', label: 'Logs', icon: SVG_LOGS, href: 'logs.html' }
     ];
 
     function findNav() {

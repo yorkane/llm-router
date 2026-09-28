@@ -45,9 +45,6 @@ code{font-family:var(--font-code);font-size:12px}
 .wrap{max-width:1240px;margin:0 auto}
 .topbar{display:flex;align-items:center;gap:12px;padding:14px 0 10px;flex-wrap:wrap}
 .topbar h1{font-size:16px;font-weight:600;margin:0}
-.back{font-size:13px;color:var(--muted);border:1px solid var(--border);border-radius:var(--radius-pill);
-  padding:4px 12px;background:var(--surface)}
-.back:hover{background:var(--raised);color:var(--text)}
 .conn{margin-left:auto;color:var(--gray);font-size:12px}
 .conn[hidden]{display:none}
 
@@ -63,15 +60,13 @@ code{font-family:var(--font-code);font-size:12px}
   padding:7px 11px;font:inherit;color:var(--text);min-width:240px;max-width:460px;flex:1 1 240px}
 .input::placeholder{color:var(--faint)}
 .input:focus{outline:none;border-color:var(--faint)}
-.toggle{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;
-  white-space:nowrap;cursor:pointer}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border:1px solid var(--border);
   border-radius:var(--radius-pill);background:var(--surface);font-size:12px;color:var(--text)}
 .btn:hover{background:var(--raised)}
 .buf{margin-left:auto;color:var(--faint);font-size:11px;white-space:nowrap}
 
-.tbl-wrap{position:relative;border:1px solid var(--border);border-radius:var(--radius);
-  background:var(--surface);overflow:auto;max-height:calc(100vh - 268px);scrollbar-gutter:stable}
+.tbl-wrap{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);
+  overflow:auto;max-height:calc(100vh - 318px);min-height:180px;scrollbar-gutter:stable}
 table{table-layout:fixed;width:100%;min-width:1040px;border-collapse:collapse;font-size:13px}
 /* 列宽沿用 opencodex logs 页：12/9/7/8/15/9/13/8/11/8 */
 /* 8 列：12/9/7/16/10/16/10/10 */
@@ -110,13 +105,6 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
 .cand .ok{color:var(--green)}
 .note{color:var(--faint);font-size:11px;margin-top:8px}
 
-.paused{position:absolute;left:50%;top:46px;transform:translateX(-50%);display:none;
-  align-items:center;gap:8px;background:var(--raised);border:1px solid var(--border);
-  border-radius:var(--radius-pill);padding:5px 14px;font-size:12px;color:var(--muted);
-  box-shadow:0 4px 16px #0009;white-space:nowrap}
-.paused.on{display:inline-flex}
-.paused[hidden]{display:none}
-
 .empty{border:1px dashed var(--border);border-radius:var(--radius);color:var(--muted);
   padding:44px 20px;text-align:center;margin-top:12px}
 .empty[hidden]{display:none}
@@ -136,8 +124,8 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
 </head>
 <body>
 <div class="wrap">
+  <div id="lmr-tabs-anchor"></div>
   <div class="topbar">
-    <a class="back" href="./">&larr; 返回聊天</a>
     <h1>Logs 日志与调试</h1>
     <span class="conn" id="conn" hidden>连接中断，重试中</span>
   </div>
@@ -154,7 +142,6 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
   <div class="toolbar">
     <input class="input" id="filter" type="search" autocomplete="off" spellcheck="false"
       placeholder="筛选日志（模型 / 提供方 / 请求 ID / 会话 / 状态码）">
-    <label class="toggle"><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
     <button class="btn" id="clear" type="button">清空</button>
     <span class="buf" id="buf">-/-</span>
   </div>
@@ -174,10 +161,6 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
       </thead>
       <tbody id="tbody"></tbody>
     </table>
-    <div class="paused" id="paused" hidden>
-      <span>已暂停滚动</span><span>·</span><span id="paused-new">有新日志</span><span>·</span>
-      <button class="detail-btn" id="tobottom" type="button">回到最新</button>
-    </div>
   </div>
 
   <div class="empty" id="empty" hidden>
@@ -195,8 +178,8 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
      2) GET ./logs/stream        SSE 低延迟追加
    按 record.seq 去重（seen 表），因此两路重复投递同一请求只会渲染一次，
    流式路径永远只 prepend <tr>（不整表重建）；只有筛选/清空/服务重启才 rebuild。
-   渲染顺序是「最新在最上面」：rows 数组仍按 seq 升序，DOM 与滚动取反向，
-   新请求出现在表格顶部、无需滚动即可看到。
+   渲染顺序是「最新在最上面」：rows 数组仍按 seq 升序，DOM 取反向渲染，
+   新请求出现在表格顶部；页面不做任何自动滚动，正在往下看历史时视口保持不动。
    stats.started_at_ms 变化 = 网关进程重启 → 环形缓冲作废 → 前端整体重置。 */
 var MAX_ROWS = 2000;                 // 前端最多留 2000 行，超出丢最旧
 var POLL_MS = 1000;
@@ -207,20 +190,14 @@ var startedAtMs = null;              // stats.started_at_ms，变化即重置
 var expanded = Object.create(null);  // seq -> true（重建后保持展开）
 var stats = null;
 var loadedOnce = false;
-var pendingNew = 0;                  // 暂停滚动期间新增的行数
 var backends = Object.create(null);  // worker host:port -> {gpu}（GET ./logs/backends）
 var lastBackendsAt = 0;              // backends 低频刷新（30s）
 
 var tbody = document.getElementById('tbody');
-var wrap = document.getElementById('wrap');
 var emptyBox = document.getElementById('empty');
 var filterBox = document.getElementById('filter');
-var autoscrollBox = document.getElementById('autoscroll');
-var pausedBox = document.getElementById('paused');
-var pausedNew = document.getElementById('paused-new');
 var connBox = document.getElementById('conn');
 var bufBox = document.getElementById('buf');
-var autoscroll = true;
 
 var ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function esc(s){ return String(s).replace(/[&<>"']/g, function(ch){ return ESC[ch]; }); }
@@ -410,8 +387,6 @@ function ingest(records){
   if (!added) return;
   trimFront();
   updateEmpty();
-  if (autoscroll) scrollToTop();
-  else { pendingNew += added; pausedNew.textContent = '有新日志'; setPaused(true); }
 }
 /* 软上限：丢弃最旧的行。rows 升序所以最旧在数组头部；DOM 是倒序（最新在上），
    最旧的行因此落在 DOM 尾部——从 lastChild 往前删，碰到仍需保留的行即停
@@ -450,7 +425,6 @@ function rebuild(){
     syncDetail(tr, r);
   }
   updateEmpty();
-  if (autoscroll) scrollToTop();
 }
 function updateEmpty(){
   var showEmpty = loadedOnce && tbody.querySelector('tr.row') === null;
@@ -458,27 +432,6 @@ function updateEmpty(){
   if (showEmpty) document.getElementById('curl-eg').textContent =
     "curl '" + new URL('./logs?cursor=0&limit=1000', location.href).href + "'";
 }
-
-/* ---------- 滚动控制：锚点在顶部（最新行），往下翻历史即暂停 ---------- */
-function atTop(){ return wrap.scrollTop < 48; }
-function scrollToTop(){ wrap.scrollTop = 0; pendingNew = 0; setPaused(false); }
-function setPaused(on){
-  pausedBox.hidden = !on;
-  pausedBox.classList.toggle('on', on);
-  if (!on) pausedNew.textContent = '';
-}
-wrap.addEventListener('scroll', function(){
-  if (!autoscroll) return;
-  if (atTop()) setPaused(false);
-  else { autoscroll = false; autoscrollBox.checked = false; setPaused(true); }  // 下滚翻历史 → 暂停
-});
-autoscrollBox.addEventListener('change', function(){
-  autoscroll = autoscrollBox.checked;
-  if (autoscroll) scrollToTop(); else setPaused(true);
-});
-document.getElementById('tobottom').addEventListener('click', function(){
-  autoscroll = true; autoscrollBox.checked = true; scrollToTop();
-});
 
 /* ---------- 行内交互（事件委托，避免逐行绑监听器） ---------- */
 tbody.addEventListener('click', function(ev){
@@ -658,5 +611,6 @@ openStream();
 schedule();
 window.addEventListener('beforeunload', function(){ if (es) es.close(); });
 </script>
+<script defer src="./lmr-tabs.js" data-active="logs"></script>
 </body>
 </html>
