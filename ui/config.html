@@ -9,6 +9,7 @@
           POST ./config/model-map   名称映射，转发 llm-watcher（旧接口，保留）
           POST ./config/model       每模型配置卡保存（字段缺省=不动；null=清除；remove:true=删除整条）
           POST ./config/apply       JSON 视图整体替换（缺省字段=清空；model_map 转发 watcher 落地）
+          POST ./config/virtual     虚拟模型别名整表替换（body {entries:[{model,target}]}，空数组=清空）
         模型下拉复用既有 GET ./v1/models。页面在 /_ui/config.html，因此 ./config 解析为 /_ui/config。
 
   两个视图（顶部 表单/JSON 分段按钮切换，共享同一份 state）：
@@ -19,7 +20,7 @@
       3) 模型名映射：转发 llm-watcher 落地（watcher ledger 持久化）。
       4) 环境默认值（只读）。
     JSON 视图：可编辑子集（default_effort / effort_map / model_ctx / model_effort /
-      model_configs / model_map）的源码编辑，「校验并应用」走 ./config/apply 整体替换。
+      model_configs / virtual_models / model_map）的源码编辑，「校验并应用」走 ./config/apply 整体替换。
       这份 JSON 等价于容器环境变量，可导出后粘进 compose 固化。
 
   每模型卡的后端语义（POST ./config/model）：
@@ -99,6 +100,7 @@ code{font-family:var(--font-code);font-size:12px}
 .hint.warn{color:var(--amber)}
 
 .field{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}
+.field[hidden]{display:none}
 .field .lbl{color:var(--muted);font-size:12px;min-width:96px}
 .select,.input{background:var(--raised);border:1px solid var(--border);border-radius:var(--radius-sm);
   padding:6px 10px;font:inherit;color:var(--text);max-width:360px}
@@ -184,9 +186,8 @@ details.env .body{margin-top:10px}
 </head>
 <body>
 <div class="wrap">
+  <div id="lmr-tabs-anchor"></div>
   <div class="topbar">
-    <a class="back" href="./">&larr; 返回聊天</a>
-    <a class="back" href="./logs.html">Logs</a>
     <h1>Config 网关配置</h1>
     <div class="seg" id="seg">
       <button type="button" id="seg-form" class="on">表单</button>
@@ -250,6 +251,21 @@ details.env .body{margin-top:10px}
       <div class="legacy-note" id="legacy-note" hidden>后端不支持每模型配置（GET ./config 无 models 字段），请升级 llm-router。</div>
     </section>
 
+    <!-- B2. 虚拟模型映射 -->
+    <section class="card">
+      <h2>虚拟模型映射</h2>
+      <p class="desc">虚拟模型是对外别名，与真实模型并存、一起出现在 <code>/v1/models</code>；
+        请求用别名会被路由到 <code>target</code> 指向的上游模型。target 不存在时，请求会得到「无可用 worker」。</p>
+      <div class="rows" id="vm-rows" hidden></div>
+      <div class="field" id="vm-actions" hidden>
+        <button class="btn mini ghost" id="vm-add" type="button">+ 添加映射</button>
+        <button class="btn" id="vm-save" type="button">保存映射</button>
+      </div>
+      <div class="hint" id="vm-hint" hidden>保存提交的是完整列表：删除一行后直接「保存映射」即可移除该别名。
+        两侧都留空的行提交时忽略；别名留空、目标留空、别名等于目标等非法行由后端整体拒绝并给出原因。</div>
+      <div class="legacy-note" id="vm-legacy-note" hidden>后端不支持虚拟模型映射（GET ./config 无 virtual_models 字段），请升级 llm-router。</div>
+    </section>
+
     <!-- C. 模型名映射 -->
     <section class="card">
       <h2>模型名映射</h2>
@@ -277,7 +293,7 @@ details.env .body{margin-top:10px}
     <section class="card">
       <h2>配置 JSON（源码编辑）</h2>
       <p class="desc">这份 JSON 等价于容器环境变量（LMR_DEFAULT_EFFORT / LMR_EFFORT_MAP / LMR_MODEL_CTX /
-        LMR_MODEL_EFFORT / LMR_MODEL_EFFORT_MAP / LMR_MODEL_MODALITIES），可以先导出再粘进 compose 固化。
+        LMR_MODEL_EFFORT / LMR_MODEL_EFFORT_MAP / LMR_MODEL_MODALITIES / LMR_VIRTUAL_MODELS），可以先导出再粘进 compose 固化。
         「校验并应用」走 <code>POST ./config/apply</code> <b>整体替换</b>：缺省字段视为清空；
         model_map 会转发 llm-watcher 落地改名。任一字段非法整体拒绝，不产生半提交。</p>
       <textarea id="json-ta" class="json-ta" spellcheck="false" placeholder="加载配置后此处显示可编辑 JSON 子集"></textarea>
@@ -301,6 +317,7 @@ details.env .body{margin-top:10px}
    cards      —— 每模型卡的编辑态 {model, registered, sources, ctx, de, emap, modAuto, mod, dirty}
    mapDraft   —— 全局强度映射草稿（数组），null = 未被用户改动
    mmDraft    —— 名称映射草稿（数组），null = 未被用户改动
+   vmDraft    —— 虚拟模型别名草稿（数组），null = 未被用户改动
    jsonDraft  —— JSON 视图本地文本，null = 与服务端 state 同步（无本地编辑）
    legacy     —— GET 响应缺 models 字段（旧后端）：卡片区显示升级提示
 
@@ -316,6 +333,7 @@ var state = null;
 var modelIds = [];
 var mapDraft = null;
 var mmDraft = null;
+var vmDraft = null;
 var cards = {};
 var legacy = false;
 var jsonDraft = null;            // null = 与服务端同步
@@ -525,8 +543,10 @@ function cardFromModel(m){
 /* 服务器 document 更新后同步卡编辑态：未 dirty 的卡整体重建，dirty 的卡保留编辑。 */
 function syncCards(doc){
   var docModels = doc && Array.isArray(doc.models) ? doc.models : null;
-  legacy = docModels === null;
+  // 只有带 models 字段的响应（GET ./config、./config/model、./config/apply）才有资格改写 legacy：
+  // ./config/effort 与 ./config/virtual 的响应本来就不含 models，不能据此判定后端过旧。
   if (docModels === null) return;
+  legacy = false;
   var seen = {};
   docModels.forEach(function(m){
     if (!m || typeof m.model !== 'string') return;
@@ -891,6 +911,68 @@ function jumpToRename(name){
 }
 
 /* ---------- C. 模型名映射 ---------- */
+/* ---------- B2. 虚拟模型映射（别名 → 真实上游模型） ----------
+   后端契约：GET  document.virtual_models = [{model,target},...]；
+             POST ./config/virtual {entries:[{model,target}]} 整表替换（空数组=清空）。
+   字段缺失（旧后端）时只显示升级提示，不提供编辑区。 */
+function vmRows(){
+  if (vmDraft) return vmDraft;
+  var src = state && Array.isArray(state.virtual_models) ? state.virtual_models : [];
+  var rows = src.map(function(r){ return { model: r.model || '', target: r.target || '' }; });
+  if (!rows.length) rows.push({ model: '', target: '' });
+  return rows;
+}
+function vmEdit(){
+  if (!vmDraft) vmDraft = vmRows().map(function(r){ return { model: r.model, target: r.target }; });
+  return vmDraft;
+}
+function renderVirtualModels(){
+  var rows = document.getElementById('vm-rows');
+  var actions = document.getElementById('vm-actions');
+  var hint = document.getElementById('vm-hint');
+  var note = document.getElementById('vm-legacy-note');
+  var supported = !!state && Array.isArray(state.virtual_models);
+  var loaded = !!state;
+  note.hidden = !(loaded && !supported);
+  rows.hidden = !supported;
+  actions.hidden = !supported;
+  hint.hidden = !supported;
+  if (!supported) { rows.innerHTML = ''; return; }
+  rows.innerHTML = '';
+  vmRows().forEach(function(row, idx){
+    var line = document.createElement('div');
+    line.className = 'erow';
+    var alias = document.createElement('input');
+    alias.className = 'input model';
+    alias.autocomplete = 'off'; alias.spellcheck = false;
+    alias.placeholder = '别名（对外模型名）';
+    alias.setAttribute('list', 'model-ids');
+    alias.value = row.model;
+    alias.disabled = loading;
+    alias.addEventListener('input', function(){ vmEdit()[idx].model = alias.value; });
+    var arrow = document.createElement('span');
+    arrow.className = 'arrow'; arrow.textContent = '→';
+    var target = document.createElement('input');
+    target.className = 'input model';
+    target.autocomplete = 'off'; target.spellcheck = false;
+    target.placeholder = 'target（真实上游模型 id）';
+    target.setAttribute('list', 'model-ids');
+    target.value = row.target;
+    target.disabled = loading;
+    target.addEventListener('input', function(){ vmEdit()[idx].target = target.value; });
+    var del = document.createElement('button');
+    del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
+    del.disabled = loading;
+    del.addEventListener('click', function(){
+      var d = vmEdit();
+      d.splice(idx, 1);
+      if (!d.length) d.push({ model: '', target: '' });
+      renderVirtualModels();
+    });
+    line.appendChild(alias); line.appendChild(arrow); line.appendChild(target); line.appendChild(del);
+    rows.appendChild(line);
+  });
+}
 function mmRows(){
   if (mmDraft) return mmDraft;
   var w = state && state.watcher ? state.watcher : {};
@@ -987,6 +1069,10 @@ function renderEnv(){
   kvLine(host, 'model_configs(env)', mm.length
     ? mm.map(function(r){ return r && r.model ? String(r.model) : '?'; }).join('，')
     : '（空）');
+  var vm = Array.isArray(e.virtual_models) ? e.virtual_models : [];
+  kvLine(host, 'virtual_models(env)', vm.length
+    ? vm.map(function(r){ return (r && r.model ? String(r.model) : '?') + ' → ' + (r && r.target ? String(r.target) : '?'); }).join('，')
+    : '（空）');
 }
 
 function renderDatalist(){
@@ -1001,7 +1087,8 @@ function renderDatalist(){
 
 /* ===================== JSON 视图 =====================
    可编辑子集（不含派生字段 watcher/env_defaults/models）：
-   default_effort / effort_map / model_ctx / model_effort / model_configs / model_map。
+   default_effort / effort_map / model_ctx / model_effort / model_configs /
+   virtual_models / model_map。
    jsonDraft === null 表示与服务端 state 同步；有本地文本时以文本为准，
    jsonDirty() 用键序无关的深度比较判断「未应用改动」。 */
 function modelConfigsArray(){
@@ -1033,6 +1120,7 @@ function buildEditableJson(){
     model_ctx: Array.isArray(s.model_ctx) ? s.model_ctx : [],
     model_effort: Array.isArray(s.model_effort) ? s.model_effort : [],
     model_configs: modelConfigsArray(),
+    virtual_models: Array.isArray(s.virtual_models) ? s.virtual_models : [],
     model_map: (w.model_map && typeof w.model_map === 'object') ? w.model_map : {}
   };
   return JSON.stringify(out, null, 2);
@@ -1142,7 +1230,8 @@ document.getElementById('json-apply').addEventListener('click', function(){
     effort_map: ('effort_map' in obj) ? obj.effort_map : [],
     model_ctx: ('model_ctx' in obj) ? obj.model_ctx : [],
     model_effort: ('model_effort' in obj) ? obj.model_effort : [],
-    model_configs: ('model_configs' in obj) ? obj.model_configs : []
+    model_configs: ('model_configs' in obj) ? obj.model_configs : [],
+    virtual_models: ('virtual_models' in obj) ? obj.virtual_models : []
   };
   if ('model_map' in obj) body.model_map = obj.model_map;   // 对象或 "orig:new,..." 字符串
   submit('./config/apply', body, '配置已整体应用', function(){
@@ -1157,6 +1246,7 @@ function render(){
   renderDefaultEffort();
   renderEffortMap();
   renderCards();
+  renderVirtualModels();
   renderModelMap();
   renderEnv();
   renderDatalist();
@@ -1167,12 +1257,19 @@ function render(){
    syncCards 保留未保存的卡编辑，thenCb 可做局部清理（如清 dirty 标记）。 */
 function submit(url, body, okMsg, thenCb){
   if (loading) return Promise.resolve(null);
+  var prevModels = state && Array.isArray(state.models) ? state.models : null;
   setBusy(true);
   return postJson(url, body).then(function(res){
     state = res;
     mapDraft = null;
     mmDraft = null;
-    legacy = !Array.isArray(res.models);
+    vmDraft = null;
+    /* ./config/effort 与 ./config/virtual 的响应不含 models（派生字段）：沿用上一份，
+       否则 JSON 视图会误以为模型配置被清空，legacy 也会被误判为旧后端。 */
+    if (!Array.isArray(state.models) && prevModels) {
+      state = Object.assign({}, state, { models: prevModels });
+    }
+    legacy = !Array.isArray(state.models);
     if (typeof thenCb === 'function') thenCb(res);
     syncCards(res);
     render();
@@ -1251,6 +1348,21 @@ document.getElementById('mm-add').addEventListener('click', function(){
   renderModelMap();
 });
 
+/* ---------- B2 虚拟模型别名 ---------- */
+document.getElementById('vm-add').addEventListener('click', function(){
+  vmEdit().push({ model: '', target: '' });
+  renderVirtualModels();
+});
+/* 整表提交：两侧都留空的行忽略，其余原样交给后端校验（别名空/目标空/别名等于目标 → 400 error 原文 toast）。
+   删到一行不剩提交空数组 = 清空全部别名。 */
+document.getElementById('vm-save').addEventListener('click', function(){
+  var entries = vmRows()
+    .filter(function(r){ return (r.model || '').trim() || (r.target || '').trim(); })
+    .map(function(r){ return { model: (r.model || '').trim(), target: (r.target || '').trim() }; });
+  submit('./config/virtual', { entries: entries },
+    entries.length ? '已保存 ' + entries.length + ' 条虚拟模型映射' : '已清空全部虚拟模型映射');
+});
+
 /* ---------- B 添加自定义模型 ---------- */
 document.getElementById('custom-add-btn').addEventListener('click', addCustom);
 document.getElementById('custom-name').addEventListener('keydown', function(e){
@@ -1285,5 +1397,6 @@ render();
 refresh();
 loadModels();
 </script>
+<script defer src="./lmr-tabs.js" data-active="config"></script>
 </body>
 </html>
