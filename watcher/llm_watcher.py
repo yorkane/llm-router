@@ -100,6 +100,10 @@ def parse_model_map_body(raw):
     ("a:b,c:d"), and the pairs string wrapped as {"map": "a:b,c:d"}. That last form
     used to fall into the object branch, which made the literal key "map" the original
     model id, so the intended rename silently never happened (hit on 217.t).
+    An empty wrapper is deliberately not unwrapped, so an empty "map" stays
+    a plain-object delete: that is the documented way to clear a poisoned entry
+    whose key literally reads "map".
+
     """
     raw = (raw or "").strip()
     if not raw:
@@ -116,7 +120,7 @@ def parse_model_map_body(raw):
         if isinstance(obj.get("map"), dict):
             obj = obj["map"]
             return {str(k): ("" if v is None else str(v)) for k, v in obj.items()}, None
-        elif isinstance(obj.get("map"), str):
+        elif isinstance(obj.get("map"), str) and obj["map"].strip():
             text = obj["map"]
         else:
             return {str(k): ("" if v is None else str(v)) for k, v in obj.items()}, None

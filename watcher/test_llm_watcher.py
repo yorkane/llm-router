@@ -1343,5 +1343,21 @@ class TestModelMapApi(unittest.TestCase):
             self.assertEqual(reloaded.model_map, {"orig-b": "new-b"})
 
 
+    def test_empty_wrapper_clears_a_poisoned_map_entry(self):
+        # The documented self-clean command. An old watcher stored the literal key
+        # "map" in the map, so {"map": ""} has to delete it again rather than be
+        # unwrapped into an empty pairs string.
+        got, err = W.parse_model_map_body('{"map": ""}')
+        self.assertIsNone(err)
+        self.assertEqual(got, {"map": ""})
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = W.Reconciler(make_cfg(os.path.join(tmp, "state"), [], router=""))
+            poisoned = rec.set_model_map({"map": "junk"})
+            self.assertEqual(poisoned, {"map": "junk"})
+            self.assertEqual(rec.set_model_map(W.parse_model_map_body(
+                '{"map": ""}')[0]), {})
+            self.assertEqual(rec.set_model_map(W.parse_model_map_body("map:")[0]), {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
