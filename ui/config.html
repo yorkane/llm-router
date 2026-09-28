@@ -3,15 +3,33 @@
   llm-router「Config 网关配置」页面（自包含单文件：内联 CSS/JS，无外部 CDN、无构建工具、无 service worker）
 
   用途：llm-router（Rust axum 网关）把官方 llama.cpp webui 静态挂在 /_ui/ 下，本文件与之同目录。
-        页面通过 ./config 读取运行时配置，通过 ./config/effort、./config/ctx、./config/model-map
-        三个 POST 接口写回；模型下拉复用既有 GET ./v1/models。页面在 /_ui/config.html，
-        因此 ./config 解析为 /_ui/config。http 明文可用。
+        页面通过 ./config 读取运行时配置；写接口：
+          POST ./config/effort      全局默认思考强度 + 全局强度映射（旧接口，保留）
+          POST ./config/ctx         单模型上下文上限（旧接口，保留）
+          POST ./config/model-map   名称映射，转发 llm-watcher（旧接口，保留）
+          POST ./config/model       每模型配置卡保存（字段缺省=不动；null=清除；remove:true=删除整条）
+          POST ./config/apply       JSON 视图整体替换（缺省字段=清空；model_map 转发 watcher 落地）
+        模型下拉复用既有 GET ./v1/models。页面在 /_ui/config.html，因此 ./config 解析为 /_ui/config。
 
-  四组能力（与后端契约一一对应）：
-    1) 默认思考强度 default_effort：请求未带 reasoning_effort 时由网关注入该值（null = 不注入）。
-    2) 思考强度映射 effort_map：命中 from 的请求把 reasoning_effort 改写为 to（例如 high→xhigh）。
-    3) 上下文上限 model_ctx：限制该模型单次请求 max_tokens 上限，并改写 /props 报告的 n_ctx。
-    4) 模型名映射 watcher.model_map：转发给 llm-watcher 落地（网关只代理，改名由 watcher 持久化）。
+  两个视图（顶部 表单/JSON 分段按钮切换，共享同一份 state）：
+    表单视图：
+      1) 思考强度（全局）：默认强度 default_effort + 全局映射 effort_map。
+      2) 模型配置：每个模型一张卡 —— 上下文长度、默认思考强度（跟随全局/不注入/8 档）、
+         该模型专属强度映射、能力启用（自动探测 or 手动 文本/图片/视频/音频，text 恒开）。
+      3) 模型名映射：转发 llm-watcher 落地（watcher ledger 持久化）。
+      4) 环境默认值（只读）。
+    JSON 视图：可编辑子集（default_effort / effort_map / model_ctx / model_effort /
+      model_configs / model_map）的源码编辑，「校验并应用」走 ./config/apply 整体替换。
+      这份 JSON 等价于容器环境变量，可导出后粘进 compose 固化。
+
+  每模型卡的后端语义（POST ./config/model）：
+      字段缺省 = 不动该字段；ctx:null = 清除上限；default_effort:null = 跟随全局，
+      字符串 "null" = 不注入（与请求档位归一化一致）；effort_map:[] = 清空该模型映射；
+      modalities:null = 自动探测（跟随上游 /props），数组 = 显式覆盖（text 恒开）；
+      remove:true = 删除整个模型配置。
+      同名多 provider 合并成一条（sources 多个 URL），是有意设计：跨 provider 同名共享一张卡。
+
+  旧后端兼容：GET 响应缺 models 字段时，卡片区显示升级提示，其余区域照常工作。
 
   官方 webui 升级后如何恢复：本文件与 logs-inject.js 都不在 SvelteKit 构建产物里
   （也不在 ui/sw.js 的 precache 列表），升级 ui/ 目录时只要不整目录删除就不会丢；
@@ -23,7 +41,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- 内联空 favicon：避免浏览器自动请求 /favicon.ico 产生 404 噪声，掩盖真实报错 -->
 <link rel="icon" href="data:,">
 <title>Config · llm-router</title>
 <style>
@@ -57,7 +74,11 @@ code{font-family:var(--font-code);font-size:12px}
 .conn{margin-left:auto;color:var(--gray);font-size:12px}
 .conn[hidden]{display:none}
 
-/* 顶部状态条：watcher 可达性（绿点在线 / 红点不可达+URL / 灰点未配置） */
+/* 表单 / JSON 分段切换 */
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-pill);overflow:hidden;background:var(--surface)}
+.seg button{padding:5px 16px;font-size:12px;color:var(--muted)}
+.seg button.on{background:var(--raised);color:var(--text)}
+
 .statusbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 14px;
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:8px 14px}
 .statusbar .lbl{color:var(--muted);font-size:12px}
@@ -83,7 +104,7 @@ code{font-family:var(--font-code);font-size:12px}
 .select:focus,.input:focus,textarea:focus{outline:none;border-color:var(--faint)}
 .input::placeholder{color:var(--faint)}
 select option{background:var(--surface);color:var(--text)}
-.input.num{width:110px;max-width:110px;text-align:right}
+.input.num{width:120px;max-width:120px;text-align:right}
 .input.model{flex:1 1 220px;min-width:180px}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border:1px solid var(--border);
   border-radius:var(--radius-pill);background:var(--surface);font-size:12px;color:var(--text)}
@@ -94,14 +115,37 @@ select option{background:var(--surface);color:var(--text)}
 .btn.danger{color:var(--red)}
 .arrow{color:var(--faint)}
 .muted{color:var(--muted)} .faint{color:var(--faint)}
-.dash{color:var(--faint)}
 
 .rows{display:flex;flex-direction:column;gap:6px;margin:8px 0}
 .rows[hidden]{display:none}
 .erow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-textarea{width:100%;background:var(--raised);border:1px solid var(--border);border-radius:var(--radius-sm);
-  padding:8px 10px;font:inherit;color:var(--text);resize:vertical;min-height:76px}
-textarea::placeholder{color:var(--faint)}
+
+/* 每模型配置卡 */
+.mcard{margin-bottom:14px}
+.mhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:2px}
+.mname{font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.msrc{color:var(--faint);font-size:11px;overflow-wrap:anywhere}
+.mhead .grow{flex:1}
+.badge{font-size:10px;padding:2px 8px;border-radius:var(--radius-pill);border:1px solid var(--border);
+  color:var(--muted);flex:none;line-height:1.4}
+.badge.reg{color:var(--green);border-color:#4ecb9d44}
+.badge.cust{color:var(--amber);border-color:#fbbf2444}
+.badge.dirty{color:var(--amber);border-color:#fbbf2444;background:#fbbf2411}
+.badge.dirty[hidden]{display:none}
+.msec{border-top:1px solid var(--border-soft);padding:10px 0 2px;margin-top:8px}
+.mtitle{font-size:12px;color:var(--muted);margin-bottom:2px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chk{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text);margin-right:12px}
+.chk input{accent-color:var(--green)}
+.chk.dis{color:var(--faint)}
+.legacy-note{color:var(--amber);font-size:12px;border:1px dashed var(--border);
+  border-radius:var(--radius-sm);padding:10px 12px;margin-top:8px}
+
+/* JSON 视图 */
+.json-ta{width:100%;min-height:380px;background:var(--raised);border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:10px 12px;font:inherit;font-size:12px;line-height:1.45;
+  color:var(--text);resize:vertical}
+.json-ta::placeholder{color:var(--faint)}
+#json-err{color:var(--red);font-size:12px;margin-top:8px;white-space:pre-wrap}
 
 /* 只读映射列表（watcher.model_map / env_defaults） */
 .list{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);
@@ -133,6 +177,7 @@ details.env .body{margin-top:10px}
 @media (max-width:640px){
   .field .lbl{min-width:100%}
   .erow .select,.erow .input{max-width:none;flex:1 1 120px}
+  .mhead .grow{flex:1 1 100%}
 }
 </style>
 </head>
@@ -142,10 +187,14 @@ details.env .body{margin-top:10px}
     <a class="back" href="./">&larr; 返回聊天</a>
     <a class="back" href="./logs.html">Logs</a>
     <h1>Config 网关配置</h1>
+    <div class="seg" id="seg">
+      <button type="button" id="seg-form" class="on">表单</button>
+      <button type="button" id="seg-json">JSON</button>
+    </div>
     <span class="conn" id="conn" hidden>配置接口不可达，重试中</span>
   </div>
 
-  <!-- A. 状态条：watcher 可达性 -->
+  <!-- 状态条：watcher 可达性 -->
   <div class="statusbar" id="statusbar">
     <span class="lbl">llm-watcher</span>
     <span class="dot off" id="w-dot"></span>
@@ -153,72 +202,88 @@ details.env .body{margin-top:10px}
     <span class="url" id="w-url"></span>
   </div>
 
-  <!-- B. 思考强度 -->
-  <section class="card">
-    <h2>思考强度</h2>
-    <p class="desc">作用于网关对 <code>reasoning_effort</code> 的注入与改写；改动立即生效，重启后回到环境默认。</p>
+  <!-- ============ 表单视图 ============ -->
+  <div id="form-view">
 
-    <div class="field">
-      <span class="lbl">默认思考强度</span>
-      <select class="select" id="eff-default"></select>
-      <button class="btn" id="eff-default-save" type="button">保存</button>
-    </div>
-    <div class="hint">请求未带 reasoning_effort 时注入该值；「跟随后端默认 (null)」表示网关不注入。</div>
+    <!-- A. 思考强度（全局） -->
+    <section class="card">
+      <h2>思考强度（全局）</h2>
+      <p class="desc">作用于网关对 <code>reasoning_effort</code> 的注入与改写；改动立即生效，重启后回到环境默认。
+        单个模型的默认强度与专属映射请在下方「模型配置」里按卡定制。</p>
 
-    <div class="field" style="margin-top:14px">
-      <span class="lbl">思考强度映射</span>
-      <button class="btn mini ghost" id="eff-map-add" type="button">添加一行</button>
-      <button class="btn" id="eff-map-save" type="button">保存映射</button>
-    </div>
-    <div class="rows" id="eff-map-rows"></div>
-    <div class="hint">命中映射的请求会把 reasoning_effort 改写为新值，例如 high&rarr;xhigh。to 留空的行提交时忽略；
-      删除一行后直接「保存映射」即可移除该映射（保存提交的是完整列表）。</div>
+      <div class="field">
+        <span class="lbl">默认思考强度</span>
+        <select class="select" id="eff-default"></select>
+        <button class="btn" id="eff-default-save" type="button">保存</button>
+      </div>
+      <div class="hint">请求未带 reasoning_effort 时注入该值；「跟随后端默认 (null)」表示网关不注入。</div>
 
-    <div class="field" style="margin-top:14px">
-      <span class="lbl">按模型定制</span>
-      <button class="btn mini ghost" id="meff-add" type="button">添加一行</button>
-      <button class="btn" id="meff-save" type="button">保存定制</button>
-    </div>
-    <div class="rows" id="meff-rows"></div>
-    <div class="hint">命中的模型对该请求强制使用右侧强度（无论请求带不带 reasoning_effort）；
-      「不定制」或整行模型名留空 = 该模型回落到上面的默认强度与映射。</div>
+      <div class="field" style="margin-top:14px">
+        <span class="lbl">思考强度映射</span>
+        <button class="btn mini ghost" id="eff-map-add" type="button">添加一行</button>
+        <button class="btn" id="eff-map-save" type="button">保存映射</button>
+      </div>
+      <div class="rows" id="eff-map-rows"></div>
+      <div class="hint">命中映射的请求会把 reasoning_effort 改写为新值，例如 high&rarr;xhigh。to 留空的行提交时忽略；
+        删除一行后直接「保存映射」即可移除该映射（保存提交的是完整列表）。</div>
+    </section>
+
+    <!-- B. 模型配置（每模型一张卡） -->
+    <section class="card">
+      <h2>模型配置</h2>
+      <p class="desc">每个模型一张卡：上下文长度、默认思考强度、该模型专属强度映射、能力启用。
+        同名模型跨多个 provider 会合并成一条（来源列显示所有端口）。</p>
+      <div class="field" id="custom-add">
+        <span class="lbl">添加自定义模型</span>
+        <input class="input model" id="custom-name" list="model-ids" autocomplete="off" spellcheck="false"
+          placeholder="模型名（下拉选择或直接输入，可输入未注册的任意名）">
+        <datalist id="model-ids"></datalist>
+        <button class="btn" id="custom-add-btn" type="button">+ 添加</button>
+      </div>
+      <div id="cards"></div>
+      <div class="legacy-note" id="legacy-note" hidden>后端不支持每模型配置（GET ./config 无 models 字段），请升级 llm-router。</div>
+    </section>
+
+    <!-- C. 模型名映射 -->
+    <section class="card">
+      <h2>模型名映射</h2>
+      <p class="desc">把上游原始模型名改写为对外名称；每行一条，「新名」留空的行视为删除该条目。</p>
+      <div class="rows" id="mm-rows"></div>
+      <div class="field">
+        <button class="btn mini ghost" id="mm-add" type="button">+ 添加映射</button>
+        <button class="btn" id="mm-apply" type="button">应用</button>
+      </div>
+      <div class="hint" id="mm-hint"></div>
+    </section>
+
+    <!-- D. 环境默认值（只读） -->
+    <details class="env" id="env-details">
+      <summary>环境默认值（只读）</summary>
+      <div class="body">
+        <p class="desc" style="margin:0 0 8px">运行时改动重启后回到环境默认；改名由 watcher ledger 持久化。</p>
+        <div class="kv" id="env-body"></div>
+      </div>
+    </details>
+  </div>
+
+  <!-- ============ JSON 视图 ============ -->
+  <section id="json-view" hidden>
+    <section class="card">
+      <h2>配置 JSON（源码编辑）</h2>
+      <p class="desc">这份 JSON 等价于容器环境变量（LMR_DEFAULT_EFFORT / LMR_EFFORT_MAP / LMR_MODEL_CTX /
+        LMR_MODEL_EFFORT / LMR_MODEL_EFFORT_MAP / LMR_MODEL_MODALITIES），可以先导出再粘进 compose 固化。
+        「校验并应用」走 <code>POST ./config/apply</code> <b>整体替换</b>：缺省字段视为清空；
+        model_map 会转发 llm-watcher 落地改名。任一字段非法整体拒绝，不产生半提交。</p>
+      <textarea id="json-ta" class="json-ta" spellcheck="false" placeholder="加载配置后此处显示可编辑 JSON 子集"></textarea>
+      <div id="json-err"></div>
+      <div class="field" style="margin-top:10px">
+        <button class="btn" id="json-apply" type="button">校验并应用</button>
+        <button class="btn ghost" id="json-copy" type="button">复制</button>
+        <button class="btn ghost" id="json-reload" type="button">重新载入</button>
+      </div>
+      <div class="hint">解析失败不发请求；应用成功后表单视图同步刷新。</div>
+    </section>
   </section>
-
-  <!-- C. 上下文上限 -->
-  <section class="card">
-    <h2>上下文上限</h2>
-    <p class="desc">限制该模型单次请求的 max_tokens 上限，并把 /props 的 n_ctx 报告值改写为该值。</p>
-    <div class="rows" id="ctx-list"></div>
-    <div class="field">
-      <input class="input model" id="ctx-model" list="model-ids" autocomplete="off" spellcheck="false"
-        placeholder="模型名（可从下拉选择或直接输入）">
-      <datalist id="model-ids"></datalist>
-      <input class="input num" id="ctx-nums" type="number" min="1" step="1" placeholder="如 32768">
-      <button class="btn" id="ctx-save" type="button">保存</button>
-    </div>
-    <div class="hint" id="ctx-empty" hidden>当前没有任何模型的上下文覆盖。</div>
-  </section>
-
-  <!-- D. 模型名映射 -->
-  <section class="card">
-    <h2>模型名映射</h2>
-    <p class="desc">把上游原始模型名改写为对外名称；每行一条，「新名」留空的行视为删除该条目。</p>
-    <div class="rows" id="mm-rows"></div>
-    <div class="field">
-      <button class="btn mini ghost" id="mm-add" type="button">+ 添加映射</button>
-      <button class="btn" id="mm-apply" type="button">应用</button>
-    </div>
-    <div class="hint" id="mm-hint"></div>
-  </section>
-
-  <!-- E. 环境默认值（只读） -->
-  <details class="env" id="env-details">
-    <summary>环境默认值（只读）</summary>
-    <div class="body">
-      <p class="desc" style="margin:0 0 8px">运行时改动重启后回到环境默认；改名由 watcher ledger 持久化。</p>
-      <div class="kv" id="env-body"></div>
-    </div>
-  </details>
 </div>
 
 <div class="toast-box" id="toast-box"></div>
@@ -226,27 +291,35 @@ details.env .body{margin-top:10px}
 <script>
 "use strict";
 /* ===================== 数据层 =====================
-   单一状态源：GET ./config 的响应体。所有写操作（三个 POST）成功后都用响应体
-   整体替换 state 并重新渲染，因此前端从不本地乐观修改状态；
-   仅「思考强度映射」的编辑行是前端临时态（renderEffortMap 里合并 state + 草稿行）。
-   模型下拉来自既有 GET ./v1/models（OpenAI 标准结构），加载失败退化为纯手动输入。 */
+   state      —— 最近一次 GET/POST ./config* 返回的完整 document（唯一服务器事实源）
+   cards      —— 每模型卡的编辑态 {model, registered, sources, ctx, de, emap, modAuto, mod, dirty}
+   mapDraft   —— 全局强度映射草稿（数组），null = 未被用户改动
+   mmDraft    —— 名称映射草稿（数组），null = 未被用户改动
+   jsonDraft  —— JSON 视图本地文本，null = 与服务端 state 同步（无本地编辑）
+   legacy     —— GET 响应缺 models 字段（旧后端）：卡片区显示升级提示
 
-/* 与后端契约一致的档位集合：下拉 9 项 = 空(跟随后端) + 以下 8 档；
-   from 列多一个空选项（表示「不限/清除」占位行）。 */
+   写操作成功后用响应体整体替换 state，再 syncCards()：
+   未 dirty 的卡用服务器值重建；dirty 的卡保留用户编辑（只刷新 registered/sources）。
+   JSON 视图若没有本地未应用改动，也随 state 静默同步。 */
+
 var EFForts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+var MOD_KEYS = ['image', 'video', 'audio'];
+var MOD_LABELS = { image: '图片', video: '视频', audio: '音频' };
 
-var state = null;                 // 最近一次 GET/POST ./config* 返回的完整结构
-var modelIds = [];                // ./v1/models 的 id 列表
-var mapDraft = null;              // 映射编辑草稿（数组 [{from,to}]），null = 未被用户改动过
-var meffDraft = null;             // 按模型强度定制草稿（数组 [{model,effort}]），null = 未被改动
-var mmDraft = null;               // 模型名映射草稿（数组 [{orig,new}]），null = 未被改动
-var loading = false;              // 全局防重复提交（任一写请求在途时禁用全部按钮）
+var state = null;
+var modelIds = [];
+var mapDraft = null;
+var mmDraft = null;
+var cards = {};
+var legacy = false;
+var jsonDraft = null;            // null = 与服务端同步
+var loading = false;
 var connBox = document.getElementById('conn');
 
 var ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function esc(s){ return String(s).replace(/[&<>"']/g, function(ch){ return ESC[ch]; }); }
 
-/* ---------- 请求封装：错误信息优先展示后端 error 字段原文 ---------- */
+/* ---------- 请求封装 ---------- */
 function errFrom(status, body){
   if (body && typeof body === 'object') {
     if (typeof body.error === 'string') return body.error;
@@ -276,7 +349,7 @@ function postJson(url, body){
   }, function(){ throw new Error('网络错误：无法连接网关'); });
 }
 
-/* ---------- toast：成功/失败短提示（样式基调沿用 logs.html 的浮层） ---------- */
+/* ---------- toast ---------- */
 function toast(kind, msg){
   var box = document.getElementById('toast-box');
   var el = document.createElement('div');
@@ -286,7 +359,7 @@ function toast(kind, msg){
   tag.textContent = kind === 'err' ? '失败' : '成功';
   var m = document.createElement('span');
   m.className = 'msg';
-  m.textContent = msg;                                   // textContent：后端 error 原文不解析 HTML
+  m.textContent = msg;
   el.appendChild(tag); el.appendChild(m);
   box.appendChild(el);
   setTimeout(function(){
@@ -295,21 +368,19 @@ function toast(kind, msg){
   }, kind === 'err' ? 6000 : 2600);
 }
 
-/* ---------- 提交锁：在途时禁用全部写按钮，防重复提交 ---------- */
+/* ---------- 提交锁 ---------- */
 function allButtons(){
-  return Array.prototype.slice.call(document.querySelectorAll('.card .btn, #mm-apply'));
+  return Array.prototype.slice.call(
+    document.querySelectorAll('.card .btn, #mm-apply, #custom-add-btn, #json-apply'));
 }
 function setBusy(on){
   loading = on;
   allButtons().forEach(function(b){ b.disabled = on; });
-  if (!on) render();                                     // 解锁后按当前状态重算禁用项（如 watcher 不可达）
+  if (!on) render();
 }
 
-/* ===================== 渲染 =====================
-   render() 以 state 为唯一事实整页重绘；模型下拉的 options 独立重建一次。 */
+/* ===================== 渲染 ===================== */
 function effortOptions(withEmpty, selected){
-  /* withEmpty=true 时补一个空值首项：selected==='' 显示「跟随后端默认 (null)」（默认档位下拉），
-     其余场合（映射行）显示「—」占位，语义是「未选择/不限」 */
   var frag = document.createDocumentFragment();
   if (withEmpty) {
     var o0 = document.createElement('option');
@@ -325,7 +396,6 @@ function effortOptions(withEmpty, selected){
   }
   return frag;
 }
-/* 把 select 的当前值对齐到 v；v 不在集合内时临时补一个高亮项（原样显示脏值，保存会覆盖） */
 function syncSelect(sel, v){
   var want = (v === null || v === undefined) ? '' : String(v);
   var known = want === '' || EFForts.indexOf(want) !== -1;
@@ -334,10 +404,10 @@ function syncSelect(sel, v){
     o.value = want; o.textContent = want + '（未知档位）';
     sel.appendChild(o);
   }
-  sel.value = known ? want : want;
+  sel.value = want;
 }
 
-/* ---------- A. 状态条 ---------- */
+/* ---------- 状态条 ---------- */
 function renderWatcher(){
   var dot = document.getElementById('w-dot');
   var val = document.getElementById('w-val');
@@ -356,31 +426,32 @@ function renderWatcher(){
   }
 }
 
-/* ---------- B1. 默认思考强度 ---------- */
+/* ---------- A1. 全局默认思考强度 ---------- */
 function renderDefaultEffort(){
   var sel = document.getElementById('eff-default');
   sel.innerHTML = '';
   sel.appendChild(effortOptions(true, ''));
   var v = state ? state.default_effort : null;
   syncSelect(sel, v);
-  // 首项 label 固定为「跟随后端默认 (null)」
   if (sel.firstElementChild) sel.firstElementChild.textContent = '跟随后端默认 (null)';
 }
 
-/* ---------- B2. 思考强度映射 ---------- */
+/* ---------- A2. 全局思考强度映射 ---------- */
 function mapRows(){
-  /* 编辑态行集合：用户改动过用草稿，否则用 state 的行 + 空态占位一行 */
   if (mapDraft) return mapDraft;
   var src = state && Array.isArray(state.effort_map) ? state.effort_map : [];
   var rows = src.map(function(r){ return { from: r.from || '', to: r.to || '' }; });
   if (!rows.length) rows.push({ from: '', to: '' });
   return rows;
 }
+function draft(){
+  if (!mapDraft) mapDraft = mapRows().map(function(r){ return { from: r.from, to: r.to }; });
+  return mapDraft;
+}
 function renderEffortMap(){
   var host = document.getElementById('eff-map-rows');
   host.innerHTML = '';
-  var rows = mapRows();
-  rows.forEach(function(row, idx){
+  mapRows().forEach(function(row, idx){
     var line = document.createElement('div');
     line.className = 'erow';
     var from = document.createElement('select');
@@ -407,86 +478,403 @@ function renderEffortMap(){
     host.appendChild(line);
   });
 }
-/* 草稿物化：第一次被用户改动时把 state 行复制成草稿 */
-function draft(){
-  if (!mapDraft) mapDraft = mapRows().map(function(r){ return { from: r.from, to: r.to }; });
-  return mapDraft;
+
+/* ---------- B. 每模型配置卡 ---------- */
+function fmtSrc(s){
+  try {
+    var u = new URL(s);
+    return u.port ? ':' + u.port : (u.host || String(s));
+  } catch (e) { return String(s); }
+}
+function cardFromModel(m){
+  var mods = Array.isArray(m.modalities) ? m.modalities : null;
+  return {
+    model: m.model,
+    registered: !!m.registered,
+    sources: Array.isArray(m.sources) ? m.sources.slice() : [],
+    ctx: (m.ctx === null || m.ctx === undefined) ? '' : String(m.ctx),
+    de: (m.default_effort === null || m.default_effort === undefined) ? '' : String(m.default_effort),
+    emap: Array.isArray(m.effort_map)
+      ? m.effort_map.map(function(r){ return { from: r.from || '', to: r.to || '' }; })
+      : [],
+    modAuto: !Array.isArray(m.modalities),
+    mod: {
+      image: !!mods && mods.indexOf('image') !== -1,
+      video: !!mods && mods.indexOf('video') !== -1,
+      audio: !!mods && mods.indexOf('audio') !== -1
+    },
+    dirty: false
+  };
+}
+/* 服务器 document 更新后同步卡编辑态：未 dirty 的卡整体重建，dirty 的卡保留编辑。 */
+function syncCards(doc){
+  var docModels = doc && Array.isArray(doc.models) ? doc.models : null;
+  legacy = docModels === null;
+  if (docModels === null) return;
+  var seen = {};
+  docModels.forEach(function(m){
+    if (!m || typeof m.model !== 'string') return;
+    seen[m.model] = true;
+    var ex = cards[m.model];
+    if (ex && ex.dirty) {
+      ex.registered = !!m.registered;
+      ex.sources = Array.isArray(m.sources) ? m.sources.slice() : [];
+    } else {
+      cards[m.model] = cardFromModel(m);
+    }
+  });
+  Object.keys(cards).forEach(function(k){
+    if (!seen[k]) {
+      var c = cards[k];
+      if (c.registered || !c.dirty) delete cards[k];   // 已注册的消失=被删；未注册的无编辑=无意义
+    }
+  });
+}
+function setCardDirty(c){
+  c.dirty = true;
+  var el = document.querySelector('#cards .mcard[data-model="' + k2attr(c.model) + '"]');
+  if (el) {
+    var b = el.querySelector('.badge.dirty');
+    if (b) b.hidden = false;
+  }
+}
+function k2attr(s){ return String(s).replace(/"/g, '&quot;'); }
+function scrollToCard(name){
+  var els = document.querySelectorAll('#cards .mcard');
+  for (var i = 0; i < els.length; i++) {
+    if (els[i].getAttribute('data-model') === name) {
+      els[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+  }
 }
 
-/* ---------- B3. 按模型定制思考强度 ---------- */
-function meffRows(){
-  if (meffDraft) return meffDraft;
-  var src = state && Array.isArray(state.model_effort) ? state.model_effort : [];
-  var rows = src.map(function(r){ return { model: r.model || '', effort: r.effort || '' }; });
-  if (!rows.length) rows.push({ model: '', effort: '' });
-  return rows;
-}
-function renderModelEffort(){
-  var host = document.getElementById('meff-rows');
+function renderCards(){
+  var host = document.getElementById('cards');
   host.innerHTML = '';
-  var rows = meffRows();
-  rows.forEach(function(row, idx){
+  document.getElementById('legacy-note').hidden = !legacy;
+  document.getElementById('custom-add').hidden = legacy;
+  var names = Object.keys(cards);
+  names.sort(function(a, b){
+    var ca = cards[a], cb = cards[b];
+    if (!!ca.registered !== !!cb.registered) return ca.registered ? -1 : 1;
+    return a.localeCompare(b);
+  });
+  names.forEach(function(n){ host.appendChild(buildCard(cards[n])); });
+  if (!names.length && !legacy) {
+    var d = document.createElement('div');
+    d.className = 'hint';
+    d.textContent = '还没有模型。可在上方添加自定义模型名（本地草稿，保存此模型后才写后端）。';
+    host.appendChild(d);
+  }
+}
+
+function buildCard(c){
+  var el = document.createElement('section');
+  el.className = 'card mcard';
+  el.setAttribute('data-model', c.model);
+
+  /* --- 卡头 --- */
+  var head = document.createElement('div');
+  head.className = 'mhead';
+  var nm = document.createElement('span');
+  nm.className = 'mname'; nm.textContent = c.model;
+  var badge = document.createElement('span');
+  badge.className = 'badge ' + (c.registered ? 'reg' : 'cust');
+  badge.textContent = c.registered ? '已注册' : '自定义';
+  var src = document.createElement('span');
+  src.className = 'msrc';
+  src.textContent = c.sources.length ? c.sources.map(fmtSrc).join(', ') : '（未注册）';
+  var dirty = document.createElement('span');
+  dirty.className = 'badge dirty'; dirty.hidden = !c.dirty; dirty.textContent = '未保存';
+  var grow = document.createElement('span');
+  grow.className = 'grow';
+  var ren = document.createElement('button');
+  ren.type = 'button'; ren.className = 'btn mini ghost'; ren.textContent = '改名';
+  ren.addEventListener('click', function(){ jumpToRename(c.model); });
+  head.appendChild(nm); head.appendChild(badge); head.appendChild(src);
+  head.appendChild(dirty); head.appendChild(grow); head.appendChild(ren);
+  el.appendChild(head);
+
+  /* --- 1) 上下文长度 --- */
+  var g1 = section(el, '上下文长度', function(btn){ saveCardFields(c, ['ctx'], '已保存 ' + c.model + ' 上下文'); });
+  var ctxRow = document.createElement('div');
+  ctxRow.className = 'field';
+  var ctxIn = document.createElement('input');
+  ctxIn.type = 'number'; ctxIn.className = 'input num';
+  ctxIn.min = '1'; ctxIn.step = '1';
+  ctxIn.placeholder = '不限（跟随上游）';
+  ctxIn.value = c.ctx;
+  ctxIn.setAttribute('data-role', 'ctx');
+  ctxIn.addEventListener('input', function(){ c.ctx = ctxIn.value; setCardDirty(c); });
+  var ctxHint = document.createElement('span');
+  ctxHint.className = 'faint'; ctxHint.style.fontSize = '11px';
+  ctxHint.textContent = '留空 = 不限制';
+  ctxRow.appendChild(ctxIn); ctxRow.appendChild(ctxHint);
+  g1.body.appendChild(ctxRow);
+
+  /* --- 2) 默认思考强度 --- */
+  var g2 = section(el, '默认思考强度', function(btn){ saveCardFields(c, ['de'], '已保存 ' + c.model + ' 默认思考强度'); });
+  var deRow = document.createElement('div');
+  deRow.className = 'field';
+  var deSel = document.createElement('select');
+  deSel.className = 'select';
+  deSel.setAttribute('data-role', 'de');
+  var o0 = document.createElement('option');
+  o0.value = ''; o0.textContent = '跟随全局';
+  var o1 = document.createElement('option');
+  o1.value = 'null'; o1.textContent = '不注入 (null)';
+  deSel.appendChild(o0); deSel.appendChild(o1);
+  for (var i = 0; i < EFForts.length; i++) {
+    var oo = document.createElement('option');
+    oo.value = EFForts[i]; oo.textContent = EFForts[i];
+    deSel.appendChild(oo);
+  }
+  syncSelect(deSel, c.de);
+  deSel.addEventListener('change', function(){ c.de = deSel.value; setCardDirty(c); });
+  deRow.appendChild(deSel);
+  g2.body.appendChild(deRow);
+  g2.hint.textContent = '请求未带强度、强度不合法、或强度映射未命中时使用该值（配了映射又未命中 → 用此默认）。';
+
+  /* --- 3) 思考强度映射（该模型专属） --- */
+  var g3 = section(el, '思考强度映射', function(btn){ saveCardFields(c, ['emap'], '已保存 ' + c.model + ' 强度映射'); });
+  var emapHost = document.createElement('div');
+  emapHost.className = 'rows';
+  g3.body.appendChild(emapHost);
+  renderCardEmap(c, emapHost);
+  g3.hint.textContent = '该模型专属的强度改写，例如 high→xhigh；未保存的行不生效。';
+
+  /* --- 4) 能力启用 --- */
+  var g4 = section(el, '能力启用', function(btn){ saveCardFields(c, ['mod'], '已保存 ' + c.model + ' 能力启用'); });
+  var modRow = document.createElement('div');
+  modRow.className = 'field';
+  var autoChk = document.createElement('input');
+  autoChk.type = 'checkbox'; autoChk.checked = c.modAuto;
+  autoChk.addEventListener('change', function(){
+    c.modAuto = autoChk.checked;
+    updateModUI();
+    setCardDirty(c);
+  });
+  var autoLbl = document.createElement('label');
+  autoLbl.className = 'chk';
+  autoLbl.appendChild(autoChk);
+  autoLbl.appendChild(document.createTextNode('自动探测（跟随上游）'));
+  modRow.appendChild(autoLbl);
+
+  var textChk = document.createElement('input');
+  textChk.type = 'checkbox'; textChk.checked = true; textChk.disabled = true;
+  var textLbl = document.createElement('label');
+  textLbl.className = 'chk dis';
+  textLbl.appendChild(textChk);
+  textLbl.appendChild(document.createTextNode('文本（恒开）'));
+  modRow.appendChild(textLbl);
+
+  var modChks = {};
+  MOD_KEYS.forEach(function(k){
+    var ch = document.createElement('input');
+    ch.type = 'checkbox';
+    ch.checked = !c.modAuto && !!c.mod[k];
+    ch.disabled = c.modAuto;
+    ch.addEventListener('change', function(){
+      if (c.modAuto) { ch.checked = false; return; }
+      c.mod[k] = ch.checked;
+      setCardDirty(c);
+    });
+    var lb = document.createElement('label');
+    lb.className = 'chk' + (c.modAuto ? ' dis' : '');
+    lb.appendChild(ch);
+    lb.appendChild(document.createTextNode(MOD_LABELS[k]));
+    modRow.appendChild(lb);
+    modChks[k] = { chk: ch, lbl: lb };
+  });
+  function updateModUI(){
+    MOD_KEYS.forEach(function(k){
+      var m = modChks[k];
+      m.chk.disabled = c.modAuto;
+      m.lbl.className = 'chk' + (c.modAuto ? ' dis' : '');
+      if (c.modAuto) m.chk.checked = false;
+      else m.chk.checked = !!c.mod[k];
+    });
+  }
+  g4.body.appendChild(modRow);
+  g4.hint.textContent = '勾选「自动探测」时跟随上游 /props 报告的能力；取消后可手动覆盖（文本恒开）。';
+
+  /* --- 卡脚 --- */
+  var foot = document.createElement('div');
+  foot.className = 'field';
+  foot.style.marginTop = '12px';
+  var saveAll = document.createElement('button');
+  saveAll.type = 'button'; saveAll.className = 'btn'; saveAll.textContent = '保存此模型';
+  saveAll.addEventListener('click', function(){
+    saveCardFields(c, ['ctx', 'de', 'emap', 'mod'], '已保存 ' + c.model + ' 的全部配置');
+  });
+  var del = document.createElement('button');
+  del.type = 'button'; del.className = 'btn danger'; del.textContent = '删除此模型配置';
+  del.addEventListener('click', function(){
+    if (!window.confirm('确定删除「' + c.model + '」的整条配置？')) return;
+    submit('./config/model', { model: c.model, remove: true }, '已删除 ' + c.model + ' 的配置', function(doc){
+      var inDoc = doc && Array.isArray(doc.models) &&
+        doc.models.some(function(m){ return m && m.model === c.model; });
+      if (!inDoc) delete cards[c.model];
+    });
+  });
+  foot.appendChild(saveAll); foot.appendChild(del);
+  el.appendChild(foot);
+
+  return el;
+}
+/* 卡片内一个配置分组：标题行（标题 + 保存按钮）+ 内容区 + 提示行 */
+function section(parent, title, onSave){
+  var box = document.createElement('div');
+  box.className = 'msec';
+  var t = document.createElement('div');
+  t.className = 'mtitle';
+  var tt = document.createElement('span');
+  tt.textContent = title;
+  var grow = document.createElement('span');
+  grow.style.flex = '1';
+  var btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'btn mini'; btn.textContent = '保存';
+  btn.addEventListener('click', function(){ onSave(btn); });
+  t.appendChild(tt); t.appendChild(grow); t.appendChild(btn);
+  var body = document.createElement('div');
+  var hint = document.createElement('div');
+  hint.className = 'hint';
+  box.appendChild(t); box.appendChild(body); box.appendChild(hint);
+  parent.appendChild(box);
+  return { body: body, hint: hint };
+}
+/* 卡内强度映射行（from/to 均 8 档 select，无空选项；新增行默认示例 high→xhigh） */
+function renderCardEmap(c, host){
+  host.innerHTML = '';
+  c.emap.forEach(function(row, idx){
     var line = document.createElement('div');
     line.className = 'erow';
-    var model = document.createElement('input');
-    model.className = 'input model';
-    model.setAttribute('list', 'model-ids');
-    model.autocomplete = 'off'; model.spellcheck = false;
-    model.placeholder = '模型名（下拉选择或输入）';
-    model.value = row.model;
-    model.addEventListener('input', function(){ meffEdit()[idx].model = model.value; });
-    var sel = document.createElement('select');
-    sel.className = 'select';
-    sel.appendChild(effortOptions(true, null));          // 首项空值 = 不定制（删除该条目）
-    if (sel.firstElementChild) sel.firstElementChild.textContent = '不定制';
-    syncSelect(sel, row.effort);
-    sel.addEventListener('change', function(){ meffEdit()[idx].effort = sel.value; });
+    var from = document.createElement('select');
+    from.className = 'select';
+    for (var i = 0; i < EFForts.length; i++) {
+      var o = document.createElement('option');
+      o.value = EFForts[i]; o.textContent = EFForts[i];
+      from.appendChild(o);
+    }
+    syncSelect(from, row.from || 'high');
+    from.addEventListener('change', function(){ c.emap[idx].from = from.value; setCardDirty(c); });
+    var arrow = document.createElement('span');
+    arrow.className = 'arrow'; arrow.textContent = '→';
+    var to = document.createElement('select');
+    to.className = 'select';
+    for (var j = 0; j < EFForts.length; j++) {
+      var o2 = document.createElement('option');
+      o2.value = EFForts[j]; o2.textContent = EFForts[j];
+      to.appendChild(o2);
+    }
+    syncSelect(to, row.to || 'xhigh');
+    to.addEventListener('change', function(){ c.emap[idx].to = to.value; setCardDirty(c); });
     var del = document.createElement('button');
     del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
     del.addEventListener('click', function(){
-      var d = meffEdit();
-      d.splice(idx, 1);
-      if (!d.length) d.push({ model: '', effort: '' });
-      renderModelEffort();
+      c.emap.splice(idx, 1);
+      renderCardEmap(c, host);
+      setCardDirty(c);
     });
-    line.appendChild(model); line.appendChild(sel); line.appendChild(del);
+    line.appendChild(from); line.appendChild(arrow); line.appendChild(to); line.appendChild(del);
     host.appendChild(line);
   });
-}
-function meffEdit(){
-  if (!meffDraft) meffDraft = meffRows().map(function(r){ return { model: r.model, effort: r.effort }; });
-  return meffDraft;
+  var add = document.createElement('div');
+  add.className = 'field';
+  var ab = document.createElement('button');
+  ab.type = 'button'; ab.className = 'btn mini ghost'; ab.textContent = '添加映射';
+  ab.addEventListener('click', function(){
+    c.emap.push({ from: 'high', to: 'xhigh' });
+    renderCardEmap(c, host);
+    setCardDirty(c);
+  });
+  add.appendChild(ab);
+  host.appendChild(add);
 }
 
-/* ---------- C. 上下文上限 ---------- */
-function fmtCtx(n){ return (typeof n === 'number' && isFinite(n)) ? n.toLocaleString('en-US') : String(n); }
-function renderCtx(){
-  var host = document.getElementById('ctx-list');
-  host.innerHTML = '';
-  var list = state && Array.isArray(state.model_ctx) ? state.model_ctx : [];
-  document.getElementById('ctx-empty').hidden = list.length > 0;
-  list.forEach(function(item){
-    var line = document.createElement('div');
-    line.className = 'erow';
-    var model = document.createElement('span');
-    model.className = 'input model';                    // 借用 .input 外观做只读展示
-    model.style.maxWidth = 'none';
-    model.textContent = item.model;                     // textContent：模型名防 XSS
-    var ctx = document.createElement('span');
-    ctx.className = 'input num';
-    ctx.style.textAlign = 'right';
-    ctx.textContent = fmtCtx(item.ctx);
-    var clr = document.createElement('button');
-    clr.type = 'button'; clr.className = 'btn mini danger'; clr.textContent = '清除';
-    clr.addEventListener('click', function(){
-      submit('./config/ctx', { model: item.model, ctx: null }, '已清除 ' + item.model);
-    });
-    line.appendChild(model); line.appendChild(ctx); line.appendChild(clr);
-    host.appendChild(line);
+/* --- 卡保存/删除 --- */
+function cardCtxValue(c){
+  var raw = (c.ctx || '').trim();
+  if (raw === '') return null;
+  var n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return -1;
+  return n;
+}
+function cardModValue(c){
+  if (c.modAuto) return null;
+  var arr = ['text'];
+  MOD_KEYS.forEach(function(k){ if (c.mod[k]) arr.push(k); });
+  return arr;
+}
+function buildCardBody(c, fields){
+  var body = { model: c.model };
+  if (fields.indexOf('ctx') !== -1) {
+    var ctx = cardCtxValue(c);
+    if (ctx === -1) return null;
+    body.ctx = ctx;                                   // null = 清除上限
+  }
+  if (fields.indexOf('de') !== -1) {
+    body.default_effort = c.de === '' ? null : c.de;  // '' → null 跟随全局；'null' 字符串 = 不注入
+  }
+  if (fields.indexOf('emap') !== -1) {
+    body.effort_map = c.emap.map(function(r){ return { from: r.from, to: r.to }; });
+  }
+  if (fields.indexOf('mod') !== -1) {
+    body.modalities = cardModValue(c);                // null = 自动探测
+  }
+  return body;
+}
+function saveCardFields(c, fields, okMsg){
+  var body = buildCardBody(c, fields);
+  if (!body) { toast('err', c.model + '：上下文长度必须是正整数（例如 32768）'); return; }
+  submit('./config/model', body, okMsg, function(doc){
+    var saved = cards[c.model];
+    if (saved && doc && Array.isArray(doc.models) &&
+        doc.models.some(function(m){ return m && m.model === c.model; })) {
+      saved.dirty = false;                            // 服务器已确认，清未保存标记
+    }
   });
 }
 
-/* ---------- D. 模型名映射（可编辑行：改新名 = 修改，新名留空 = 删除） ---------- */
+/* --- 添加自定义模型（本地草稿卡） --- */
+function addCustom(){
+  if (legacy) return;
+  var inp = document.getElementById('custom-name');
+  var name = (inp.value || '').trim();
+  if (!name) { toast('err', '请输入模型名'); return; }
+  if (cards[name]) { toast('ok', name + ' 的模型卡已存在'); scrollToCard(name); return; }
+  cards[name] = {
+    model: name, registered: false, sources: [], ctx: '', de: '', emap: [],
+    modAuto: true, mod: { image: false, video: false, audio: false }, dirty: true
+  };
+  inp.value = '';
+  renderCards();
+  scrollToCard(name);
+}
+
+/* --- 改名：预填名称映射区新行并滚动过去 --- */
+function jumpToRename(name){
+  var w = state && state.watcher ? state.watcher : {};
+  if (!(w.url && w.reachable)) {
+    toast('err', '无法添加名称映射：watcher 未配置或不可达');
+    return;
+  }
+  var rows = mmEdit();
+  var idx = -1;
+  rows.forEach(function(r, i){ if ((r.orig || '').trim() === name) idx = i; });
+  if (idx === -1) { rows.push({ orig: name, new: '' }); idx = rows.length - 1; }
+  renderModelMap();
+  var host = document.getElementById('mm-rows');
+  var line = host.children[idx];
+  if (line) {
+    line.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    var inps = line.querySelectorAll('input');
+    if (inps.length > 1) inps[1].focus();
+  }
+}
+
+/* ---------- C. 模型名映射 ---------- */
 function mmRows(){
   if (mmDraft) return mmDraft;
   var w = state && state.watcher ? state.watcher : {};
@@ -518,8 +906,7 @@ function renderModelMap(){
   }
   var host = document.getElementById('mm-rows');
   host.innerHTML = '';
-  var rows = mmRows();
-  rows.forEach(function(row, idx){
+  mmRows().forEach(function(row, idx){
     var line = document.createElement('div');
     line.className = 'erow';
     var orig = document.createElement('input');
@@ -552,7 +939,8 @@ function renderModelMap(){
   });
 }
 
-/* ---------- E. 环境默认值（只读） ---------- */
+/* ---------- D. 环境默认值（只读） ---------- */
+function fmtCtx(n){ return (typeof n === 'number' && isFinite(n)) ? n.toLocaleString('en-US') : String(n); }
 function kvLine(host, k, v){
   var row = document.createElement('div');
   row.className = 'li';
@@ -579,6 +967,10 @@ function renderEnv(){
   kvLine(host, 'model_effort', me.length
     ? me.map(function(r){ return r.model + ' = ' + r.effort; }).join('，')
     : '（空）');
+  var mm = Array.isArray(e.models) ? e.models : [];
+  kvLine(host, 'model_configs(env)', mm.length
+    ? mm.map(function(r){ return r && r.model ? String(r.model) : '?'; }).join('，')
+    : '（空）');
 }
 
 function renderDatalist(){
@@ -586,72 +978,222 @@ function renderDatalist(){
   dl.innerHTML = '';
   modelIds.forEach(function(id){
     var o = document.createElement('option');
-    o.value = id;                                        // option.value 不进 HTML 解析，安全
+    o.value = id;
     dl.appendChild(o);
   });
 }
+
+/* ===================== JSON 视图 =====================
+   可编辑子集（不含派生字段 watcher/env_defaults/models）：
+   default_effort / effort_map / model_ctx / model_effort / model_configs / model_map。
+   jsonDraft === null 表示与服务端 state 同步；有本地文本时以文本为准，
+   jsonDirty() 用键序无关的深度比较判断「未应用改动」。 */
+function modelConfigsArray(){
+  var arr = [];
+  if (state && Array.isArray(state.models)) {
+    state.models.forEach(function(m){
+      if (!m || typeof m.model !== 'string') return;
+      var has = m.ctx !== null && m.ctx !== undefined ||
+        m.default_effort !== null && m.default_effort !== undefined ||
+        (Array.isArray(m.effort_map) && m.effort_map.length > 0) ||
+        m.modalities !== null && m.modalities !== undefined;
+      if (!has) return;
+      var e = { model: m.model };
+      if (m.ctx !== null && m.ctx !== undefined) e.ctx = m.ctx;
+      if (m.default_effort !== null && m.default_effort !== undefined) e.default_effort = m.default_effort;
+      if (Array.isArray(m.effort_map) && m.effort_map.length > 0) e.effort_map = m.effort_map;
+      if (m.modalities !== null && m.modalities !== undefined) e.modalities = m.modalities;
+      arr.push(e);
+    });
+  }
+  return arr;
+}
+function buildEditableJson(){
+  var s = state || {};
+  var w = s.watcher || {};
+  var out = {
+    default_effort: (s.default_effort === undefined) ? null : s.default_effort,
+    effort_map: Array.isArray(s.effort_map) ? s.effort_map : [],
+    model_ctx: Array.isArray(s.model_ctx) ? s.model_ctx : [],
+    model_effort: Array.isArray(s.model_effort) ? s.model_effort : [],
+    model_configs: modelConfigsArray(),
+    model_map: (w.model_map && typeof w.model_map === 'object') ? w.model_map : {}
+  };
+  return JSON.stringify(out, null, 2);
+}
+function normStr(o){
+  if (o === null || typeof o !== 'object') return JSON.stringify(o);
+  if (Array.isArray(o)) return '[' + o.map(normStr).join(',') + ']';
+  var ks = Object.keys(o).sort();
+  return '{' + ks.map(function(k){ return JSON.stringify(k) + ':' + normStr(o[k]); }).join(',') + '}';
+}
+function jsonDirty(){
+  if (jsonDraft === null) return false;
+  try {
+    var a = normStr(JSON.parse(jsonDraft));
+    var b = normStr(JSON.parse(buildEditableJson()));
+    return a !== b;
+  } catch (e) { return true; }
+}
+function syncJsonFromState(){
+  if (jsonDraft !== null && !jsonDirty()) jsonDraft = null;   // 无本地编辑 → 静默跟服务端
+  if (jsonDraft === null) jsonDraft = buildEditableJson();
+  if (!document.getElementById('json-view').hidden) renderJsonTa();
+}
+function renderJsonTa(){
+  document.getElementById('json-ta').value = jsonDraft === null ? buildEditableJson() : jsonDraft;
+}
+function describeParseErr(draft, msg){
+  var m = /line (\d+) column (\d+)/i.exec(msg);
+  if (m) return msg + '\n（第 ' + m[1] + ' 行，第 ' + m[2] + ' 列）';
+  var p = /position (\d+)/.exec(msg);
+  if (p) {
+    var pos = Math.min(+p[1], draft.length), line = 1, col = 1;
+    for (var i = 0; i < pos; i++) {
+      if (draft[i] === '\n') { line++; col = 1; } else col++;
+    }
+    return msg + '\n（第 ' + line + ' 行，第 ' + col + ' 列）';
+  }
+  return msg;
+}
+function showJsonErr(msg){
+  var el = document.getElementById('json-err');
+  el.textContent = msg || '';
+  el.hidden = !msg;
+}
+function segShow(name){
+  var form = document.getElementById('form-view');
+  var jsonv = document.getElementById('json-view');
+  var fBtn = document.getElementById('seg-form');
+  var jBtn = document.getElementById('seg-json');
+  if (name === 'json') {
+    form.hidden = true; jsonv.hidden = false;
+    fBtn.className = ''; jBtn.className = 'on';
+    renderJsonTa();
+  } else {
+    form.hidden = false; jsonv.hidden = true;
+    fBtn.className = 'on'; jBtn.className = '';
+    showJsonErr('');
+  }
+}
+document.getElementById('seg-form').addEventListener('click', function(){
+  if (jsonDirty()) {
+    /* 询问：确定 = 丢弃 JSON 本地编辑（表单/服务器当前值为准）切回表单；取消 = 留在 JSON 视图继续编辑 */
+    if (!window.confirm('JSON 有未应用的改动。丢弃这些编辑并切回表单视图？\n（表单视图的当前值仍然有效）')) return;
+    jsonDraft = null;
+  }
+  segShow('form');
+});
+document.getElementById('seg-json').addEventListener('click', function(){ segShow('json'); });
+
+document.getElementById('json-ta').addEventListener('input', function(){
+  jsonDraft = this.value;
+});
+document.getElementById('json-reload').addEventListener('click', function(){
+  jsonDraft = buildEditableJson();
+  showJsonErr('');
+  renderJsonTa();
+  toast('ok', 'JSON 已按服务器状态重新载入');
+});
+document.getElementById('json-copy').addEventListener('click', function(){
+  var ta = document.getElementById('json-ta');
+  var s = ta.value;
+  function fallback(){
+    ta.focus(); ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    toast(ok ? 'ok' : 'err', ok ? '已复制到剪贴板' : '复制失败：当前环境不支持剪贴板');
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(s).then(function(){ toast('ok', '已复制到剪贴板'); }, fallback);
+  } else fallback();
+});
+document.getElementById('json-apply').addEventListener('click', function(){
+  var draftText = jsonDraft === null ? buildEditableJson() : jsonDraft;
+  var obj;
+  try { obj = JSON.parse(draftText); } catch (e) {
+    showJsonErr(describeParseErr(draftText, e.message || String(e)));
+    return;                                           // 解析失败不发请求
+  }
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    showJsonErr('JSON 顶层必须是对象（object）');
+    return;
+  }
+  showJsonErr('');
+  /* 只透传可编辑字段（缺省 = 整体替换语义下视为清空） */
+  var body = {
+    default_effort: ('default_effort' in obj) ? obj.default_effort : null,
+    effort_map: ('effort_map' in obj) ? obj.effort_map : [],
+    model_ctx: ('model_ctx' in obj) ? obj.model_ctx : [],
+    model_effort: ('model_effort' in obj) ? obj.model_effort : [],
+    model_configs: ('model_configs' in obj) ? obj.model_configs : []
+  };
+  if ('model_map' in obj) body.model_map = obj.model_map;   // 对象或 "orig:new,..." 字符串
+  submit('./config/apply', body, '配置已整体应用', function(){
+    jsonDraft = null;                                    // 以响应重建
+  });
+});
+
+/* ===================== 渲染主入口 ===================== */
 function render(){
   renderWatcher();
   renderDefaultEffort();
   renderEffortMap();
-  renderModelEffort();
-  renderCtx();
+  renderCards();
   renderModelMap();
   renderEnv();
   renderDatalist();
 }
 
 /* ===================== 写操作 =====================
-   统一走 submit()：加锁 → POST → 成功则用响应体整体刷新（模型名映射除外，
-   它只回 ok/model_map/note，故局部更新 state.watcher.model_map 并重拉一次整页）。 */
-function submit(url, body, okMsg){
+   submit(url, body, okMsg, thenCb)：加锁 → POST → 成功则用响应体整体刷新 state，
+   syncCards 保留未保存的卡编辑，thenCb 可做局部清理（如清 dirty 标记）。 */
+function submit(url, body, okMsg, thenCb){
   if (loading) return Promise.resolve(null);
   setBusy(true);
   return postJson(url, body).then(function(res){
+    state = res;
+    mapDraft = null;
+    mmDraft = null;
+    legacy = !Array.isArray(res.models);
+    if (typeof thenCb === 'function') thenCb(res);
+    syncCards(res);
+    render();
+    syncJsonFromState();
     setBusy(false);
     connBox.hidden = true;
     if (url === './config/model-map') {
-      if (!state) state = {};
-      if (!state.watcher) state.watcher = { url: null, reachable: false, model_map: null };
-      state.watcher.model_map = res && res.model_map ? res.model_map : null;
-      render();
       toast('ok', okMsg + (res && res.note ? ' · ' + res.note : ''));
       if (res && res.warning) toast('err', '注意（部分项被忽略）：' + res.warning);
-      refresh();                                          // 改名会连带影响模型列表，整页重拉一次
+      refresh();
     } else {
-      state = res;                                        // 其余接口返回最新完整 GET 结构
-      mapDraft = null;                                    // 映射以服务端为准重建
-      meffDraft = null;
-      mmDraft = null;
-      render();
       toast('ok', okMsg);
+      if (res && res.warning) toast('err', '注意：' + res.warning);
     }
     return res;
   }, function(err){
     setBusy(false);
-    toast('err', err && err.message ? err.message : String(err));   // 后端 error 字段原样展示
+    toast('err', err && err.message ? err.message : String(err));
     return null;
   });
 }
 
-/* ---------- B1 保存默认档位 ---------- */
+/* ---------- A1 保存全局默认档位 ---------- */
 document.getElementById('eff-default-save').addEventListener('click', function(){
   var v = document.getElementById('eff-default').value;
   var cur = state ? state.default_effort : null;
-  var next = v === '' ? null : v;                         // 空串按 null 处理（契约）
+  var next = v === '' ? null : v;
   if (next === cur) { toast('ok', '默认思考强度未变化'); return; }
   submit('./config/effort', { default_effort: next },
     next === null ? '默认思考强度已设为跟随后端默认' : '默认思考强度已设为 ' + next);
 });
 
-/* ---------- B2 映射：增行 / 保存 ---------- */
+/* ---------- A2 全局映射 ---------- */
 document.getElementById('eff-map-add').addEventListener('click', function(){
   draft().push({ from: '', to: '' });
   renderEffortMap();
 });
 document.getElementById('eff-map-save').addEventListener('click', function(){
-  /* 提交组装：from 与 to 都选齐的行才生效；to 空串由后端按「删除该映射」处理，
-     前端直接把这种行排除即可等价表达删除；全部有效行组成完整列表（空数组 = 清空）。 */
   var eff = mapRows()
     .filter(function(r){ return r.from && r.to; })
     .map(function(r){ return { from: r.from, to: r.to }; });
@@ -664,32 +1206,18 @@ document.getElementById('eff-map-save').addEventListener('click', function(){
     eff.length ? '已保存 ' + eff.length + ' 条思考强度映射' : '已清空全部思考强度映射');
 });
 
-/* ---------- C 保存上下文上限 ---------- */
-document.getElementById('ctx-save').addEventListener('click', function(){
-  var model = document.getElementById('ctx-model').value.trim();
-  var raw = document.getElementById('ctx-nums').value.trim();
-  var n = Number(raw);
-  if (!model) { toast('err', '请填写模型名'); return; }
-  if (!raw || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
-    toast('err', '上下文必须是正整数（例如 32768）');
-    return;
-  }
-  submit('./config/ctx', { model: model, ctx: n }, '已设置 ' + model + ' 上限 ' + fmtCtx(n));
-});
-
-/* ---------- D 应用模型名映射（diff 提交：修改/新增发 orig:new，删除发 orig:""） ---------- */
+/* ---------- C 应用模型名映射（diff 提交） ---------- */
 document.getElementById('mm-apply').addEventListener('click', function(){
   var cur = (state && state.watcher && state.watcher.model_map) || {};
   var next = {};
   var bad = [];
   mmRows().forEach(function(r){
     var o = (r.orig || '').trim(), n = (r.new || '').trim();
-    if (!o) return;                                       // 占位空行
+    if (!o) return;
     if (n.indexOf(':') !== -1 || o.indexOf(':') !== -1) { bad.push(o); return; }
     if (n) next[o] = n;
   });
   if (bad.length) { toast('err', '条目内不能含冒号：' + bad.join('，')); return; }
-  /* 逐 key diff：新增/改名发新值；旧 key 不在 next 里 = 删除（发空串） */
   var body = {};
   var changed = 0;
   Object.keys(next).forEach(function(k){
@@ -701,30 +1229,15 @@ document.getElementById('mm-apply').addEventListener('click', function(){
   if (!changed) { toast('ok', '模型名映射未变化'); return; }
   submit('./config/model-map', body, '模型名映射已提交（' + changed + ' 项变更）');
 });
-
-/* ---------- D 添加映射行 ---------- */
 document.getElementById('mm-add').addEventListener('click', function(){
   mmEdit().push({ orig: '', new: '' });
   renderModelMap();
 });
 
-/* ---------- B3 按模型定制：增行 / 保存 ---------- */
-document.getElementById('meff-add').addEventListener('click', function(){
-  meffEdit().push({ model: '', effort: '' });
-  renderModelEffort();
-});
-document.getElementById('meff-save').addEventListener('click', function(){
-  /* 完整列表语义：模型名留空或强度=不定制 的行即删除/忽略该定制 */
-  var eff = meffRows()
-    .filter(function(r){ return (r.model || '').trim() && r.effort; })
-    .map(function(r){ return { model: r.model.trim(), effort: r.effort }; });
-  var cur = (state && Array.isArray(state.model_effort)) ? state.model_effort : [];
-  var same = eff.length === cur.length && eff.every(function(r, i){
-    return cur[i] && cur[i].model === r.model && cur[i].effort === r.effort;
-  });
-  if (same) { toast('ok', '按模型定制未变化'); return; }
-  submit('./config/effort', { model_effort: eff },
-    eff.length ? '已保存 ' + eff.length + ' 条按模型定制' : '已清空全部按模型定制');
+/* ---------- B 添加自定义模型 ---------- */
+document.getElementById('custom-add-btn').addEventListener('click', addCustom);
+document.getElementById('custom-name').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') addCustom();
 });
 
 /* ===================== 初始化 ===================== */
@@ -732,8 +1245,12 @@ function refresh(){
   return fetchJson('./config').then(function(cfg){
     state = cfg;
     mapDraft = null;
+    mmDraft = null;
+    legacy = !Array.isArray(cfg.models);
+    syncCards(cfg);
     connBox.hidden = true;
     render();
+    syncJsonFromState();
   }, function(err){
     connBox.hidden = false;
     toast('err', '读取配置失败：' + (err && err.message ? err.message : String(err)));
@@ -747,7 +1264,7 @@ function loadModels(){
   }, function(){ /* 模型列表拿不到就退化为手动输入，不打扰 */ });
 }
 
-render();                                                 // 先渲染空态，避免白屏
+render();
 refresh();
 loadModels();
 </script>
