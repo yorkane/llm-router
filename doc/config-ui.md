@@ -125,6 +125,8 @@ in-flight 请求不重放。优先级：watcher `POST /model-map` > `--model-map
 Config 页行为：watcher 未配置或不可达时，改名卡片的输入框和按钮禁用并给出提示；
 应用成功后页面自动重拉整页（改名会连带改变 `/v1/models` 列表）。
 
+直连 watcher 本身的同名控制面（`GET`/`POST /model-map` 的 4 种 body 形态、返回体、生效时机与历史坑的自查/自清命令）见 `watcher/README.md` 的 `Renaming model ids (model map)` 一节。
+
 ## 6. 已知限制
 
 - `/generate` 端点不改写 effort、也不钳制上下文；

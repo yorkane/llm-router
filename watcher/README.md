@@ -126,7 +126,7 @@ already write in compose files). Precedence: flag > `LLM_WATCHER_X` > plain `X` 
 | `LLM_WATCHER_ACTIVITY_FAIL_THRESHOLD` / `_SLOW_FACTOR` | Strikes before eviction, and the multiplier applied when probes time out rather than being refused |
 | `LLM_WATCHER_ACTIVITY_PROTECTED` | `false` exempts workers that were already in the pool at first contact (`--worker-urls`, hand-added). Those are never removed for disappearing, so with this off their models are exactly the ones that can linger in /v1/models forever |
 | `LLM_WATCHER_SHORT_MODEL_NAMES` | Register `/models/foo.gguf` as `foo` (llama.cpp reports the full path) |
-| `LLM_WATCHER_MODEL_MAP` | Renames as `orig1:new1,orig2:new2`; the `LMR_MODEL_MAP` / `LMR_MODLE_MAP` spellings are honoured too |
+| `LLM_WATCHER_MODEL_MAP` | Renames as `orig1:new1,orig2:new2`; the `LMR_MODEL_MAP` / `LMR_MODLE_MAP` spellings, plus `MODEL_MAP` / `MODEL_ID_MAP` / `MODEL_RENAME`, are honoured too |
 | `LLM_WATCHER_METRICS_PORT` | Prometheus port, `0` disables it |
 
 A blank or unset value never overrides a default, and a value that is not a number is
@@ -153,21 +153,46 @@ Some backends advertise an awkward public id (llama.cpp serves the full
 worker itself is untouched. The key is the id the service reports (`/models/x.gguf`), or the short name when `--short-model-names` is on. Precedence per original id: `POST /model-map` (saved in
 the ledger) > `--model-map` flags > environment variable.
 
+**At start**, the map comes from env (compose) or repeatable flags:
+
 ```bash
-# at start, via env (compose) or repeatable flags
 LLM_WATCHER_MODEL_MAP="/models/Qwen3.8-27B.gguf:qwen38,gpt-oss-120b:gpt-oss"
 python3 watcher/llm_watcher.py --model-map "a.gguf:a" --model-map "b.gguf:b"
-
-# at runtime, on the metrics port -- applied on the next reconcile pass
-curl -s localhost:9912/model-map                        # current map as JSON
-curl -s -X POST localhost:9912/model-map -d '{"a.gguf":"a"}'   # JSON, or "a.gguf:a"
-curl -s -X POST localhost:9912/model-map -d '{"a.gguf":""}'    # delete one entry
 ```
 
-Changing the id of a worker the watcher already owns makes it delete and re-add that
-worker under the new name on the next pass; protected workers are never touched.
-The map lives in the ledger, so API edits survive a restart; in-flight requests are
-not replayed against the old id.
+The value is `orig1:new1,orig2:new2` (comma, `; `or newline separated). Besides `LLM_WATCHER_MODEL_MAP`, the aliases `MODEL_MAP`, `MODEL_ID_MAP`, `MODEL_RENAME`, `LMR_MODEL_MAP` and the historical misspelling `LMR_MODLE_MAP` are honoured; the `LLM_WATCHER_` prefix is optional and the first non-empty value wins.
+
+**At runtime**, the metrics port doubles as a control plane: `GET` / `POST http://<metrics-port>/model-map` (9912 in the 21.k/217.t/local deploys).
+
+```bash
+curl -s http://127.0.0.1:9912/model-map                                   # current map as JSON
+curl -s -X POST http://127.0.0.1:9912/model-map -H 'content-type: application/json' -d '{"a.gguf":"a"}'   # plain object, merged
+curl -s -X POST http://127.0.0.1:9912/model-map -d 'a.gguf:a,b.gguf:b'                                   # bare orig:new pairs
+curl -s -X POST http://127.0.0.1:9912/model-map -d '{"a.gguf":""}'    # empty new id deletes the entry
+```
+
+All four body shapes are accepted and equivalent: the plain object `{"orig":"new"}`, that object wrapped as `{"map": {"orig":"new"}}`, the bare pairs string `orig1:new1,orig2:new2` (any content-type), and the pairs string wrapped as `{"map": "orig1:new1,orig2:new2"}`.
+A POST **merges** into the current map (it does not replace it) and returns the full effective map after the merge:
+
+```json
+{
+  "model_map": { "a.gguf": "a" },
+  "note": "owned workers are re-registered on the next pass"
+}
+```
+
+A bad body is a `400` naming the reason and the offending entries, and the map is left untouched.
+
+> **Known historical pitfall.** Before the four shapes were supported, posting `{"map":"a:b"}` fell into the object branch and stored the literal key `map` as an original model id: the intended rename silently never happened, and the garbage entry persisted in the ledger. If a watcher on an old build did that, the map still carries it.
+> Self-check: `curl -s http://127.0.0.1:9912/metrics | grep model_map_entries` shows how many entries are active, and `docker exec llm-watcher cat /var/lib/llm-watcher/ledger.json` shows the stored map (look for a `"map"` key).
+> Clean it with `curl -s -X POST http://127.0.0.1:9912/model-map -d '{"map":""}'`.
+
+Changing the id of a worker the watcher already owned makes it delete and re-add that
+worker under the new name on the **next reconcile pass** -- no router restart.
+Protected workers are never touched. The map lives in the ledger, so API edits survive
+a watcher restart; in-flight requests are not replayed against the old id. The webui
+config page edits the same endpoint via `POST /_ui/config/model-map` on the router
+port -- see [doc/config-ui.md](../doc/config-ui.md).
 
 ## Tests
 
