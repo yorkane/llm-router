@@ -255,6 +255,7 @@ class Candidate:
     source: str
     label: str = ""
     instance_key: Optional[str] = None
+    gpu: Optional[str] = None
 
 
 @dataclass
@@ -264,6 +265,17 @@ class WorkerInfo:
     engine: str
     has_health: bool
     label: str = ""
+    gpu: Optional[str] = None
+
+
+GPU_NAME_RE = re.compile(r"gpu(\d+(?:,\d+)*)", re.I)
+
+
+def gpu_from_name(name):
+    """GPU ids embedded in a container/service name (pennyroyal-gpu7 -> "7",
+    qwen3.8-flashnext-gpu45 -> "45"). None when the name carries no hint."""
+    m = GPU_NAME_RE.search(name or "")
+    return m.group(1) if m else None
 
 
 def listening_sockets():
@@ -342,6 +354,7 @@ def docker_candidates(socket_path, include_container_ips=True):
                 source="docker",
                 label=name,
                 instance_key=ctr.get("Id"),
+                gpu=gpu_from_name(name),
             ))
         if host_net or not include_container_ips:
             # Host-network containers share the host stack: /proc/net/tcp already covers
@@ -787,6 +800,7 @@ class Reconciler:
             if info is None:
                 return None
             info.label = item.label or info.engine
+            info.gpu = item.gpu
             return item, info
 
         with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as pool:
@@ -837,17 +851,41 @@ class Reconciler:
             if url not in actual and url not in pending:
                 self._add(info)
 
-        # model_map (or --short-model-names) changed: recycle owned workers so the
-        # next pass re-adds them under the new public id. Protected workers stay.
-        for url, info in sorted(desired.items()):
-            entry = self.ledger.owned.get(url)
-            if not entry or url in self._pending or url not in actual:
+        # model_map (or --short-model-names) changed: recycle workers so the next
+        # pass re-adds them under the new public id. Owned workers go through their
+        # ledger entry; protected ones (from --worker-urls / first-run snapshot)
+        # have no entry, but a rename must still reach them -- otherwise the API
+        # keeps advertising the old id forever. Same hand-off trick as
+        # _evict_unresponsive: dropping the protection lets discovery re-add the
+        # URL as ours, and the ADD carries the renamed model id.
+        # Protected URLs are excluded from `desired` by design, so iterate over
+        # what discovery saw and pull the protected ones in here.
+        rename_targets = dict(desired)
+        for info in discovered:
+            if info.url in self.ledger.protected:
+                rename_targets.setdefault(info.url, info)
+        for url, info in sorted(rename_targets.items()):
+            if url in self._pending or url not in actual:
                 continue
             want = self._model_name(info.models[0])
             have = str(actual[url].get("model_id") or "")
-            if entry.get("model_id") != want and have != want:
-                LOG.info("Rename %s: registered %r, want %r; re-registering", url, have, want)
-                self._remove(url, entry, 0.0)
+            entry = self.ledger.owned.get(url)
+            if entry:
+                if entry.get("model_id") != want and have != want:
+                    LOG.info("Rename %s: registered %r, want %r; re-registering", url, have, want)
+                    self._remove(url, entry, 0.0)
+            elif url in self.ledger.protected and have and have != want:
+                LOG.info("Rename %s: protected worker still registered as %r, want %r; "
+                         "adopting it to apply the new id", url, have, want)
+                self.ledger.protected.discard(url)
+                wid = str(actual[url].get("id") or "")
+                if wid and not cfg.dry_run:
+                    ok, detail = self.router.delete(wid)
+                    if not ok:
+                        LOG.error("Rename %s: DELETE %s failed: %s", url, wid, detail)
+                        self.ledger.protected.add(url)
+                        continue
+                    self.stats["removes"] += 1
 
         for url, entry in sorted(list(self.ledger.owned.items())):
             if url in desired:
@@ -1151,8 +1189,11 @@ class Reconciler:
         if len(info.models) > 1:
             LOG.info("%s serves %d models; registering as '%s' (the router keys one model per URL)",
                      info.url, len(info.models), model_id)
+        labels = {"managed-by": MANAGED_LABEL, "engine": info.engine}
+        if info.gpu:
+            labels["gpu"] = info.gpu
         extra = {
-            "labels": {"managed-by": MANAGED_LABEL, "engine": info.engine},
+            "labels": labels,
             "health_check_interval_secs": cfg.health_check_interval_secs,
             "health_check_timeout_secs": cfg.health_check_timeout_secs,
             "health_failure_threshold": cfg.health_failure_threshold,
