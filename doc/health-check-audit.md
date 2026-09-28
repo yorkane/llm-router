@@ -92,3 +92,26 @@ watcher 暴露 10 个指标（llm_watcher.py:1189-1198）：`reconciles_total`�
 **总体评价**：这套设计里最值钱的三个决策都验证成立——400 确实不算不健康（且会清 strike）；slow/dead 双阈值（3 vs 9 次）让 262K 长上下文 worker 有 9 分钟预算；keep-last + 1800s grace 防单副本误杀。真正需要动手的是 404 永免区遇上 model-map 的漏杀组合（建议 1）、加载期 5xx 与进程死亡的混淆（建议 2），以及 watcher 重启丢 strike（建议 3）——三者都是小改动。
 
 > 附：gateway(Rust 侧) 行号由子代理独立核实，以 2026-09-28 工作区为准。
+
+## 8. 修复状态（2026-09-28 追记）
+
+本节记录第 7 节建议的修复进展；第 1–7 节为审查当时的快照，正文保持原样未改动。
+
+| 建议 | 漏洞（一句话） | 修复方式（一句话） | 状态与证据 |
+|---|---|---|---|
+| 1 | model-map 改名后 probe 用公共 id 打 vLLM 回 404，落入永免区，僵尸永不可剔除 | probe 改用 worker 自报 id：新增 `Reconciler._probe_id(url, item, advertised)`，优先级 discovery 的 `WorkerInfo.models[0]` > router metadata `served_model_name` > `model_id`；`_check_activity` 签名改为接收 discovered 结果（`_check_activity(actual, discovered)`） | 已修复并上线。提交 `acc4fe1`；回归 81→86（新增 `TestActivityFixes` 5 例）；已部署 21.k / 217.t / 235.t |
+| 2 | 模型加载期 503 与进程死亡都判 dead，按 3 次阈值约 3 分钟误摘（21.k 8022 真实发生过） | `activity_probe` 新增独立 `"error"` verdict；`_note_activity` 里 `"slow"` 与 `"error"` 共用 lenient 预算 = `activity_fail_threshold × activity_slow_factor`（默认 3×3=9 次），仅 refused（`"dead"`）走 3 次 | 已修复并上线。提交 `acc4fe1`；用例与部署同建议 1 |
+| 3 | strike 纯内存，watcher 每重启一次僵尸的 strike 清零一次 | `Ledger` 新增 `strikes: Dict[str,int]` 并持久化进 ledger.json；alive / 剔除 / 离开池时清除；`_check_activity` 在内存态缺失时从 ledger 恢复计数；新增 metric `llm_watcher_activity_strikes` | 已修复并上线。提交 `acc4fe1`；用例与部署同建议 1 |
+
+**第 4 个问题（报告外新发现）**：修完上述 3 个之后才暴露——`POST /model-map` 旧代码只认 `{"map": {...}}` dict 形态，POST `{"map": "orig:new"}` 字符串时缺少 string 分支，字面量 key `map` 被当成原模型名存进映射，改名静默失败并污染 ledger（217.t 实际踩到）。修复：抽出 `parse_model_map_body(raw)`，支持 plain object / `{"map": {...}}` / 裸 `a:b,c:d` / `{"map": "a:b,c:d"}` 四种形态，并带错误返回。回归 86→94（新增 `TestModelMapApi` 8 例）。追记时该修复位于工作区、尚未进 main，届时随提交落号。
+
+**本节的时点**：上表反映的是提交 `acc4fe1`（2026-09-28，main）之后的状态。第 2、4 节里被描述为「风险」的两处行为——加载期 5xx 按 dead 计罚导致约 3 分钟误摘、model-map 改名后的 404 永久漏杀——均已不再成立，通读前文时请以本节为准。
+
+**仍未处理**（第 7 节第 4–9 条，截至追记时均未落地）：
+
+- 建议 4：`_add` 仍随 POST /workers 发送 router 会忽略的 per-worker 健康参数，也未补 `update_worker_properties`；
+- 建议 5：metrics 仍无 per-worker 维度（无 `llm_watcher_last_remove_timestamp` 等），`router_reachable` 仍与 `last_error` 耦合（DELETE 失败会把它打成 0）；
+- 建议 6：404 永免区无「连续 N 次后重探 /v1/models」兜底，400→alive 清零 strike 的副作用仍在（建议 1 只堵住了 model-map 改名这一条主要触发路径）；
+- 建议 7：发现层 missing 分支仍是「单轮未出现即开始计时」，无连续 2–3 轮容忍；
+- 建议 8：`add_confirm_timeout` 默认仍 180s，部署侧未调高；
+- 建议 9：docker 扫描仍只看 `status=running`，未利用 `Health.Status`。
