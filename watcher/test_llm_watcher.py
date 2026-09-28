@@ -1286,5 +1286,62 @@ class TestActivityFixes(WatcherTestCase):
         self.assertNotIn(sick.url, router.pool)
 
 
+class TestModelMapApi(unittest.TestCase):
+    """POST /model-map accepts every body shape callers actually send."""
+
+    def test_plain_object(self):
+        got, err = W.parse_model_map_body('{"orig-a": "new-a"}')
+        self.assertIsNone(err)
+        self.assertEqual(got, {"orig-a": "new-a"})
+
+    def test_wrapped_object(self):
+        got, err = W.parse_model_map_body('{"map": {"orig-a": "new-a"}}')
+        self.assertIsNone(err)
+        self.assertEqual(got, {"orig-a": "new-a"})
+
+    def test_bare_pairs(self):
+        got, err = W.parse_model_map_body("orig-a:new-a, orig-b:new-b")
+        self.assertIsNone(err)
+        self.assertEqual(got, {"orig-a": "new-a", "orig-b": "new-b"})
+
+    def test_wrapped_pairs_string(self):
+        # The shape that used to poison the map: the literal key "map" became the
+        # original model id, so the intended rename silently never happened (217.t).
+        got, err = W.parse_model_map_body('{"map": "Huihui-Ornith-1.5-35B-A3B-abliterated:ornith15-35b-ab"}')
+        self.assertIsNone(err)
+        self.assertEqual(got, {"Huihui-Ornith-1.5-35B-A3B-abliterated": "ornith15-35b-ab"})
+        self.assertNotIn("map", got)
+
+    def test_empty_value_deletes_entry(self):
+        got, err = W.parse_model_map_body('{"orig-a": ""}')
+        self.assertIsNone(err)
+        self.assertEqual(got, {"orig-a": ""})
+
+    def test_wrapped_pairs_delete(self):
+        got, err = W.parse_model_map_body('{"map": "orig-a:"}')
+        self.assertIsNone(err)
+        self.assertEqual(got, {"orig-a": ""})
+
+    def test_rejects_garbage(self):
+        for raw in ("", "garbage-no-colon", "[1,2]", "{not json", '{"map": "junk"}'):
+            got, err = W.parse_model_map_body(raw)
+            self.assertIsNone(got, raw)
+            self.assertTrue(err, raw)
+
+    def test_set_model_map_end_to_end(self):
+        # set_model_map is what the API handler calls: wrapped pairs must land as
+        # real renames, an empty new id must delete, and it must survive restart.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "state-map-api")
+            rec = W.Reconciler(make_cfg(state, [], router=""))
+            merged = rec.set_model_map(W.parse_model_map_body(
+                '{"map": "orig-a:new-a,orig-b:new-b"}')[0])
+            self.assertEqual(merged, {"orig-a": "new-a", "orig-b": "new-b"})
+            merged = rec.set_model_map(W.parse_model_map_body('{"map": "orig-a:"}')[0])
+            self.assertEqual(merged, {"orig-b": "new-b"})
+            reloaded = W.Ledger(os.path.join(state, "ledger.json"))
+            self.assertEqual(reloaded.model_map, {"orig-b": "new-b"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

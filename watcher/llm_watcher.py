@@ -92,6 +92,49 @@ def _env_bool(name, default):
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def parse_model_map_body(raw):
+    """Turn a POST /model-map body into ({original: new}, error).
+
+    Four shapes are accepted because callers reach for all of them: a plain object
+    {"orig": "new"}, that object wrapped as {"map": {...}}, a bare pairs string
+    ("a:b,c:d"), and the pairs string wrapped as {"map": "a:b,c:d"}. That last form
+    used to fall into the object branch, which made the literal key "map" the original
+    model id, so the intended rename silently never happened (hit on 217.t).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, {"error": 'empty body; send {"original":"new"} or '
+                                   "original:new (an empty new id deletes the entry)"}
+    text = raw
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except Exception as exc:
+            return None, {"error": "invalid JSON: %s" % exc}
+        if not isinstance(obj, dict):
+            return None, {"error": "JSON body must be an object"}
+        if isinstance(obj.get("map"), dict):
+            obj = obj["map"]
+            return {str(k): ("" if v is None else str(v)) for k, v in obj.items()}, None
+        elif isinstance(obj.get("map"), str):
+            text = obj["map"]
+        else:
+            return {str(k): ("" if v is None else str(v)) for k, v in obj.items()}, None
+    mapping, bad = {}, []
+    for part in re.split(r"[,;\n]+", text):
+        part = part.strip()
+        if not part:
+            continue
+        orig, sep, new = part.partition(":")
+        if not sep or not orig.strip():
+            bad.append(part)
+            continue
+        mapping[orig.strip()] = new.strip()
+    if bad:
+        return None, {"error": "want original:new per entry", "ignored": bad}
+    return mapping, None
+
+
 def parse_model_map(spec):
     """Parse `orig1:new1,orig2:new2` into {orig: new}. Empty values drop nothing."""
     out = {}
@@ -1256,37 +1299,10 @@ def start_metrics(reconciler, port):
                 raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
             except Exception:
                 raw = ""
-            raw = raw.strip()
-            if not raw:
-                self._json(400, {"error": 'empty body; send {"original":"new"} or '
-                                          "original:new (an empty new id deletes the entry)"})
+            mapping, err = parse_model_map_body(raw)
+            if err:
+                self._json(400, err)
                 return
-            if raw.startswith("{"):
-                try:
-                    obj = json.loads(raw)
-                except Exception as exc:
-                    self._json(400, {"error": "invalid JSON: %s" % exc})
-                    return
-                if not isinstance(obj, dict):
-                    self._json(400, {"error": "JSON body must be an object"})
-                    return
-                if isinstance(obj.get("map"), dict):
-                    obj = obj["map"]
-                mapping = {str(k): ("" if v is None else str(v)) for k, v in obj.items()}
-            else:
-                mapping, bad = {}, []
-                for part in re.split(r"[,;\n]+", raw):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    orig, sep, new = part.partition(":")
-                    if not sep or not orig.strip():
-                        bad.append(part)
-                        continue
-                    mapping[orig.strip()] = new.strip()
-                if bad:
-                    self._json(400, {"error": "want original:new per entry", "ignored": bad})
-                    return
             merged = reconciler.set_model_map(mapping)
             LOG.info("model-map updated via API -> %s", merged)
             self._json(200, {"model_map": merged,
