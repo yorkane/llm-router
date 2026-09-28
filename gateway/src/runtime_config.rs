@@ -31,6 +31,11 @@ pub const ENV_MODEL_MODALITIES: &str = "LMR_MODEL_MODALITIES";
 /// Env: base URL of the llm-watcher control plane used for model renames.
 pub const ENV_WATCHER_URL: &str = "LMR_WATCHER_URL";
 
+/// Env: virtual model aliases, e.g. LMR_VIRTUAL_MODELS=fast:qwen3-32b,code:glm-4
+/// (alias:real-upstream-model-id). Virtual names are advertised in /v1/models
+/// alongside the real ones and resolve to their target at routing time.
+pub const ENV_VIRTUAL_MODELS: &str = "LMR_VIRTUAL_MODELS";
+
 /// Env: path of the JSON file where the Config page state is persisted. An
 /// unset value disables persistence (memory-only, the historical behaviour).
 pub const ENV_CONFIG_FILE: &str = "LMR_CONFIG_FILE";
@@ -85,6 +90,9 @@ pub struct RuntimeConfig {
     pub model_effort: HashMap<String, String>,
     /// model id -> the per-model card (ctx / default effort / effort map / caps).
     pub model_configs: HashMap<String, ModelConfig>,
+    /// virtual alias -> real upstream model id; aliases coexist with the real
+    /// models in every discovery surface and resolve just before routing.
+    pub virtual_models: HashMap<String, String>,
 }
 
 impl RuntimeConfig {
@@ -164,12 +172,22 @@ impl RuntimeConfig {
         for (model, caps) in per_model_caps {
             model_configs.entry(model).or_default().modalities = Some(caps);
         }
+        let virtual_models = parse_pairs(std::env::var(ENV_VIRTUAL_MODELS).ok().as_deref())
+            .into_iter()
+            .filter_map(|(alias, target)| {
+                if alias.is_empty() || target.is_empty() || alias == target {
+                    return None;
+                }
+                Some((alias, target))
+            })
+            .collect();
         RuntimeConfig {
             default_effort,
             effort_map,
             model_ctx,
             model_effort,
             model_configs,
+            virtual_models,
         }
     }
 
@@ -310,12 +328,19 @@ impl RuntimeConfig {
                 })
             })
             .collect();
+        let mut vm: Vec<(&String, &String)> = self.virtual_models.iter().collect();
+        vm.sort_by(|a, b| a.0.cmp(b.0));
+        let virtual_models: Vec<Value> = vm
+            .into_iter()
+            .map(|(alias, target)| json!({"model": alias, "target": target}))
+            .collect();
         json!({
             "default_effort": self.default_effort,
             "effort_map": effort_map,
             "model_ctx": model_ctx,
             "model_effort": model_effort,
             "model_configs": model_configs,
+            "virtual_models": virtual_models,
         })
     }
 }
@@ -756,6 +781,35 @@ impl RuntimeConfigStore {
                 next.model_effort.insert(model.to_string(), effort);
             }
         }
+        if let Some(entries) = patch.get("virtual_models") {
+            let list = entries
+                .as_array()
+                .ok_or_else(|| "virtual_models must be an array".to_string())?;
+            for entry in list {
+                let alias = entry
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let target = entry
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if alias.is_empty() {
+                    return Err("virtual_models entries need a model (the alias)".to_string());
+                }
+                if target.is_empty() {
+                    return Err(format!("virtual model {} needs a target model", alias));
+                }
+                if alias == target {
+                    return Err(format!("virtual model {} must differ from its target", alias));
+                }
+                next.virtual_models.insert(alias, target);
+            }
+        }
         if let Some(entries) = patch.get("model_configs") {
             let list = entries
                 .as_array()
@@ -785,6 +839,59 @@ impl RuntimeConfigStore {
         Self::from_document(value)
     }
 
+    /// Whole-list replace for the virtual model table (the Config page always
+    /// submits the complete list; empty clears it). Validated first so a bad
+    /// row can never half-apply.
+    pub fn apply_virtual_models(&self, entries: &Value) -> Result<Value, String> {
+        let list = entries
+            .as_array()
+            .ok_or_else(|| "virtual_models must be an array".to_string())?;
+        let mut built: HashMap<String, String> = HashMap::new();
+        for entry in list {
+            let alias = entry
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let target = entry
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if alias.is_empty() || target.is_empty() {
+                return Err("virtual model entries need both model and target".to_string());
+            }
+            if alias == target {
+                return Err(format!("virtual model {} must differ from its target", alias));
+            }
+            built.insert(alias, target);
+        }
+        let mut cfg = self.read();
+        cfg.virtual_models = built;
+        self.write(cfg);
+        Ok(self.read().snapshot())
+    }
+
+    /// All configured aliases, sorted, for /v1/models advertisement.
+    pub fn virtual_models_list(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self.read().virtual_models.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        out.sort();
+        out
+    }
+
+    /// Resolve a request model: virtual alias -> real upstream id, otherwise
+    /// the name unchanged. Callers route/log under the resolved id and keep
+    /// the original only for the request log.
+    pub fn resolve_model(&self, model: &str) -> String {
+        let cfg = self.read();
+        cfg.virtual_models
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| model.to_string())
+    }
+
     /// Registered models (id -> worker urls) merged with the config cards, for
     /// the Config page. A name served by two providers is one card on purpose.
     pub fn models_document(&self, registered: Vec<(String, String)>) -> Value {
@@ -803,6 +910,12 @@ impl RuntimeConfigStore {
                 sources.insert(model.clone(), Vec::new());
             }
         }
+        for alias in cfg.virtual_models.keys() {
+            if !sources.contains_key(alias) {
+                order.push(alias.clone());
+                sources.insert(alias.clone(), Vec::new());
+            }
+        }
         order.sort();
         let models: Vec<Value> = order
             .into_iter()
@@ -812,7 +925,7 @@ impl RuntimeConfigStore {
                     .map(|c| c.effort_map.iter().collect())
                     .unwrap_or_default();
                 map.sort_by(|a, b| a.0.cmp(b.0));
-                json!({
+                let mut doc = json!({
                     "model": model,
                     "registered": !sources[&model].is_empty(),
                     "sources": sources[&model],
@@ -823,7 +936,17 @@ impl RuntimeConfigStore {
                         .map(|(from, to)| json!({"from": from, "to": to}))
                         .collect::<Vec<Value>>(),
                     "modalities": card.and_then(|c| c.modalities.clone()),
-                })
+                });
+                if let Some(target) = cfg.virtual_models.get(&model) {
+                    doc["target"] = json!(target);
+                    // A virtual name that shadows a real model still counts as
+                    // registered (it resolves to live upstreams); keep the fact
+                    // visible for the UI badges.
+                    if !sources[&model].is_empty() {
+                        doc["registered"] = json!(true);
+                    }
+                }
+                doc
             })
             .collect();
         json!(models)
@@ -948,5 +1071,65 @@ fn load_persisted(path: &std::path::Path) -> Result<Option<Value>, String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(value: Value) -> RuntimeConfig {
+        RuntimeConfigStore::from_document(&value).expect("document should validate")
+    }
+
+    #[test]
+    fn virtual_models_roundtrip_and_validation() {
+        let cfg = doc(json!({
+            "virtual_models": [
+                {"model": "fast", "target": "qwen3-32b"},
+                {"model": "code", "target": "glm-4"}
+            ]
+        }));
+        assert_eq!(cfg.virtual_models.get("fast").map(String::as_str), Some("qwen3-32b"));
+        assert!(RuntimeConfigStore::from_document(&json!({
+            "virtual_models": [{"model": "x", "target": "x"}]
+        }))
+        .is_err());
+        assert!(RuntimeConfigStore::from_document(&json!({
+            "virtual_models": [{"model": "x", "target": ""}]
+        }))
+        .is_err());
+        // absent section clears (whole-document replace semantics)
+        let cleared = doc(json!({}));
+        assert!(cleared.virtual_models.is_empty());
+    }
+
+    #[test]
+    fn snapshot_keeps_virtual_models() {
+        let cfg = doc(json!({"virtual_models": [{"model": "a", "target": "b"}]}));
+        let snap = cfg.snapshot();
+        let again = RuntimeConfigStore::from_snapshot(&snap).expect("snapshot reloads");
+        assert_eq!(again.virtual_models.get("a").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn env_seed_resolves_pairs() {
+        // parse_pairs on "fast:qwen,code:glm" feeds the env seed path; the
+        // store itself is a process singleton, so only the pure parser is
+        // exercised here.
+        // The parser itself is permissive: an empty right-hand side survives as an
+        // empty string (only an empty *name* is dropped), and alias == target is
+        // kept. The env seed path filters both before inserting into the table.
+        let pairs = parse_pairs(Some("fast:qwen3 , code:glm-4 ,bad: ,same:same"));
+        assert_eq!(
+            pairs,
+            vec![
+                ("fast".to_string(), "qwen3".to_string()),
+                ("code".to_string(), "glm-4".to_string()),
+                ("bad".to_string(), String::new()),
+                ("same".to_string(), "same".to_string())
+            ]
+        );
     }
 }

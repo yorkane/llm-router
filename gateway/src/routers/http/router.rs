@@ -279,6 +279,16 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
+        // Virtual model aliases (/_ui/config, LMR_VIRTUAL_MODELS): the client
+        // asked for an alias; everything downstream - worker selection, policy,
+        // candidate set, and the forwarded payload - uses the real upstream id.
+        // The request log keeps both (requested_model vs model).
+        let requested_alias = model_id;
+        let resolved_model: Option<String> = model_id.map(|m| {
+            crate::runtime_config::RuntimeConfigStore::install().resolve_model(m)
+        });
+        let model_id = resolved_model.as_deref().or(model_id);
+
         let worker = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
@@ -311,6 +321,16 @@ impl Router {
                 )
             }
         };
+        // Alias requests carry the virtual name in the body; point the payload
+        // (and every per-model lookup below, effort cards included) at the real
+        // upstream id before any policy runs.
+        if let (Some(real), Some(payload_model)) =
+            (model_id, payload.get("model").and_then(|v| v.as_str()))
+        {
+            if payload_model != real {
+                payload["model"] = serde_json::json!(real);
+            }
+        }
         let (requested_effort, effective_effort) = if route == "/generate" {
             (None, None)
         } else {
@@ -324,7 +344,7 @@ impl Router {
             let session =
                 crate::observability::request_log::head_fields_from_body(&payload).2;
             ingest.note_request(
-                model_id.unwrap_or("unknown"),
+                requested_alias.unwrap_or("unknown"),
                 requested_effort.as_deref(),
                 session,
                 is_stream,

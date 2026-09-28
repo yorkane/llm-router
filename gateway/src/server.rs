@@ -221,6 +221,10 @@ fn ui_props_with_ctx(value: Value, wanted: Option<&str>) -> Value {
 
 async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
     let cap_model = wanted.clone();
+    // An alias asked for in the UI addresses the upstream model's props.
+    let wanted: Option<String> = wanted.as_ref().map(|m| {
+        crate::runtime_config::RuntimeConfigStore::install().resolve_model(m)
+    });
     let candidates: Vec<Arc<dyn Worker>> = state
         .context
         .worker_registry
@@ -483,6 +487,7 @@ async fn ui_logs_stream() -> Response {
 
 async fn ui_models(State(state): State<Arc<AppState>>) -> Response {
     let mut data: Vec<Value> = Vec::new();
+    let virtual_aliases = crate::runtime_config::RuntimeConfigStore::install().virtual_models_list();
     for worker in state.context.worker_registry.get_all() {
         for model in worker.models() {
             let id = &model.id;
@@ -500,6 +505,19 @@ async fn ui_models(State(state): State<Arc<AppState>>) -> Response {
             }));
         }
     }
+    for (alias, target) in virtual_aliases {
+        if data.iter().any(|m| m["id"].as_str() == Some(alias.as_str())) {
+            continue;
+        }
+        data.push(json!({
+            "id": alias,
+            "object": "model",
+            "created": 0,
+            "owned_by": format!("llm-router->{}", target),
+            "status": {"value": "loaded"},
+        }));
+    }
+    data.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
     Json(json!({"object": "list", "data": data})).into_response()
 }
 
@@ -618,6 +636,18 @@ async fn ui_config_ctx(Json(patch): Json<CtxPatch>) -> Response {
     }
 }
 
+/// Whole-list replace of the virtual model table: {entries: [{model, target}]}.
+/// Aliases are advertised in /v1/models next to the real models and resolve to
+/// their target at routing time.
+async fn ui_config_virtual(Json(body): Json<Value>) -> Response {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    let entries = body.get("entries").cloned().unwrap_or_else(|| json!([]));
+    match store.apply_virtual_models(&entries) {
+        Ok(_) => Json(store.document().await).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    }
+}
+
 /// Rename request forwarded verbatim to the watcher control plane. The body is
 /// either {"map":"orig:new,..."} or an object; the watcher re-registers the
 /// owned workers on its next pass and persists the table in its ledger.
@@ -719,6 +749,7 @@ fn ui_config_routes() -> Router<Arc<AppState>> {
         .route("/_ui/config/effort", post(ui_config_effort))
         .route("/_ui/config/ctx", post(ui_config_ctx))
         .route("/_ui/config/model", post(ui_config_model))
+        .route("/_ui/config/virtual", post(ui_config_virtual))
         .route("/_ui/config/apply", post(ui_config_apply))
         .route("/_ui/config/model-map", post(ui_config_model_map))
 }
@@ -790,7 +821,50 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.get_models(req).await
+    let response = state.router.get_models(req).await;
+    inject_virtual_models(response).await
+}
+
+/// Advertise the virtual model aliases next to the real ones: discovery
+/// (/v1/models) must show both so clients can pick an alias, and the aliases
+/// stay live as long as their target is registered.
+async fn inject_virtual_models(response: Response) -> Response {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    let aliases = store.virtual_models_list();
+    if aliases.is_empty() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 4 * 1024 * 1024).await else {
+        return Response::from_parts(parts, axum::body::Body::empty());
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    if let Some(list) = value.get_mut("data").and_then(|v| v.as_array_mut()) {
+        for (alias, target) in aliases {
+            if list
+                .iter()
+                .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(alias.as_str()))
+            {
+                continue; // a real worker already serves this name
+            }
+            list.push(json!({
+                "id": alias,
+                "object": "model",
+                "created": 0,
+                "owned_by": format!("llm-router->{}", target),
+            }));
+        }
+        list.sort_by(|a, b| {
+            a.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+        });
+        return (parts.status, parts.headers, Json(value)).into_response();
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
