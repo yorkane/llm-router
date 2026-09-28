@@ -173,6 +173,15 @@ details.env .body{margin-top:10px}
     <div class="rows" id="eff-map-rows"></div>
     <div class="hint">命中映射的请求会把 reasoning_effort 改写为新值，例如 high&rarr;xhigh。to 留空的行提交时忽略；
       删除一行后直接「保存映射」即可移除该映射（保存提交的是完整列表）。</div>
+
+    <div class="field" style="margin-top:14px">
+      <span class="lbl">按模型定制</span>
+      <button class="btn mini ghost" id="meff-add" type="button">添加一行</button>
+      <button class="btn" id="meff-save" type="button">保存定制</button>
+    </div>
+    <div class="rows" id="meff-rows"></div>
+    <div class="hint">命中的模型对该请求强制使用右侧强度（无论请求带不带 reasoning_effort）；
+      「不定制」或整行模型名留空 = 该模型回落到上面的默认强度与映射。</div>
   </section>
 
   <!-- C. 上下文上限 -->
@@ -193,15 +202,13 @@ details.env .body{margin-top:10px}
   <!-- D. 模型名映射 -->
   <section class="card">
     <h2>模型名映射</h2>
-    <p class="desc">把上游原始模型名改写为对外名称。<code>原始名:新名</code>，每行一条，也接受逗号分隔。</p>
-    <textarea id="mm-text" spellcheck="false" placeholder="qwen3-32b:qwen3-32b-prod&#10;Ornith-35B:ornith"></textarea>
+    <p class="desc">把上游原始模型名改写为对外名称；每行一条，「新名」留空的行视为删除该条目。</p>
+    <div class="rows" id="mm-rows"></div>
     <div class="field">
+      <button class="btn mini ghost" id="mm-add" type="button">+ 添加映射</button>
       <button class="btn" id="mm-apply" type="button">应用</button>
-      <span class="muted" id="mm-note"></span>
     </div>
     <div class="hint" id="mm-hint"></div>
-    <div class="muted" style="margin-top:10px">当前生效映射</div>
-    <div class="list" id="mm-list"></div>
   </section>
 
   <!-- E. 环境默认值（只读） -->
@@ -231,6 +238,8 @@ var EFForts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultr
 var state = null;                 // 最近一次 GET/POST ./config* 返回的完整结构
 var modelIds = [];                // ./v1/models 的 id 列表
 var mapDraft = null;              // 映射编辑草稿（数组 [{from,to}]），null = 未被用户改动过
+var meffDraft = null;             // 按模型强度定制草稿（数组 [{model,effort}]），null = 未被改动
+var mmDraft = null;               // 模型名映射草稿（数组 [{orig,new}]），null = 未被改动
 var loading = false;              // 全局防重复提交（任一写请求在途时禁用全部按钮）
 var connBox = document.getElementById('conn');
 
@@ -404,6 +413,51 @@ function draft(){
   return mapDraft;
 }
 
+/* ---------- B3. 按模型定制思考强度 ---------- */
+function meffRows(){
+  if (meffDraft) return meffDraft;
+  var src = state && Array.isArray(state.model_effort) ? state.model_effort : [];
+  var rows = src.map(function(r){ return { model: r.model || '', effort: r.effort || '' }; });
+  if (!rows.length) rows.push({ model: '', effort: '' });
+  return rows;
+}
+function renderModelEffort(){
+  var host = document.getElementById('meff-rows');
+  host.innerHTML = '';
+  var rows = meffRows();
+  rows.forEach(function(row, idx){
+    var line = document.createElement('div');
+    line.className = 'erow';
+    var model = document.createElement('input');
+    model.className = 'input model';
+    model.setAttribute('list', 'model-ids');
+    model.autocomplete = 'off'; model.spellcheck = false;
+    model.placeholder = '模型名（下拉选择或输入）';
+    model.value = row.model;
+    model.addEventListener('input', function(){ meffEdit()[idx].model = model.value; });
+    var sel = document.createElement('select');
+    sel.className = 'select';
+    sel.appendChild(effortOptions(true, null));          // 首项空值 = 不定制（删除该条目）
+    if (sel.firstElementChild) sel.firstElementChild.textContent = '不定制';
+    syncSelect(sel, row.effort);
+    sel.addEventListener('change', function(){ meffEdit()[idx].effort = sel.value; });
+    var del = document.createElement('button');
+    del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
+    del.addEventListener('click', function(){
+      var d = meffEdit();
+      d.splice(idx, 1);
+      if (!d.length) d.push({ model: '', effort: '' });
+      renderModelEffort();
+    });
+    line.appendChild(model); line.appendChild(sel); line.appendChild(del);
+    host.appendChild(line);
+  });
+}
+function meffEdit(){
+  if (!meffDraft) meffDraft = meffRows().map(function(r){ return { model: r.model, effort: r.effort }; });
+  return meffDraft;
+}
+
 /* ---------- C. 上下文上限 ---------- */
 function fmtCtx(n){ return (typeof n === 'number' && isFinite(n)) ? n.toLocaleString('en-US') : String(n); }
 function renderCtx(){
@@ -432,15 +486,26 @@ function renderCtx(){
   });
 }
 
-/* ---------- D. 模型名映射 ---------- */
+/* ---------- D. 模型名映射（可编辑行：改新名 = 修改，新名留空 = 删除） ---------- */
+function mmRows(){
+  if (mmDraft) return mmDraft;
+  var w = state && state.watcher ? state.watcher : {};
+  var map = w.model_map;
+  var keys = map && typeof map === 'object' ? Object.keys(map) : [];
+  var rows = keys.map(function(k){ return { orig: k, new: String(map[k]) }; });
+  if (!rows.length) rows.push({ orig: '', new: '' });
+  return rows;
+}
+function mmEdit(){
+  if (!mmDraft) mmDraft = mmRows().map(function(r){ return { orig: r.orig, new: r.new }; });
+  return mmDraft;
+}
 function renderModelMap(){
   var w = state && state.watcher ? state.watcher : {};
   var btn = document.getElementById('mm-apply');
   var hint = document.getElementById('mm-hint');
-  var ta = document.getElementById('mm-text');
   var usable = !!(w.url && w.reachable);
   btn.disabled = !usable || loading;
-  ta.disabled = !usable;
   hint.className = 'hint';
   if (!w.url) {
     hint.classList.add('warn');
@@ -451,24 +516,39 @@ function renderModelMap(){
   } else {
     hint.textContent = '应用后由 llm-watcher 落地并持久化（watcher ledger）。';
   }
-  var list = document.getElementById('mm-list');
-  list.innerHTML = '';
-  var map = w.model_map;
-  var keys = map && typeof map === 'object' ? Object.keys(map) : [];
-  if (!keys.length) {
-    var li = document.createElement('div');
-    li.className = 'li';
-    li.innerHTML = '<span class="dash">-</span>';
-    list.appendChild(li);
-  }
-  keys.forEach(function(k){
-    var li = document.createElement('div');
-    li.className = 'li';
-    var a = document.createElement('span'); a.textContent = k;
-    var arrow = document.createElement('span'); arrow.className = 'arrow'; arrow.textContent = '→';
-    var b = document.createElement('span'); b.textContent = String(map[k]);
-    li.appendChild(a); li.appendChild(arrow); li.appendChild(b);
-    list.appendChild(li);
+  var host = document.getElementById('mm-rows');
+  host.innerHTML = '';
+  var rows = mmRows();
+  rows.forEach(function(row, idx){
+    var line = document.createElement('div');
+    line.className = 'erow';
+    var orig = document.createElement('input');
+    orig.className = 'input model';
+    orig.autocomplete = 'off'; orig.spellcheck = false;
+    orig.placeholder = '原始模型名';
+    orig.value = row.orig;
+    orig.disabled = !usable;
+    orig.addEventListener('input', function(){ mmEdit()[idx].orig = orig.value; });
+    var arrow = document.createElement('span');
+    arrow.className = 'arrow'; arrow.textContent = '→';
+    var nv = document.createElement('input');
+    nv.className = 'input model';
+    nv.autocomplete = 'off'; nv.spellcheck = false;
+    nv.placeholder = '新名（留空 = 删除该条目）';
+    nv.value = row.new;
+    nv.disabled = !usable;
+    nv.addEventListener('input', function(){ mmEdit()[idx].new = nv.value; });
+    var del = document.createElement('button');
+    del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
+    del.disabled = !usable;
+    del.addEventListener('click', function(){
+      var d = mmEdit();
+      d.splice(idx, 1);
+      if (!d.length) d.push({ orig: '', new: '' });
+      renderModelMap();
+    });
+    line.appendChild(orig); line.appendChild(arrow); line.appendChild(nv); line.appendChild(del);
+    host.appendChild(line);
   });
 }
 
@@ -495,6 +575,10 @@ function renderEnv(){
   kvLine(host, 'model_ctx', mc.length
     ? mc.map(function(r){ return r.model + ' = ' + fmtCtx(r.ctx); }).join('，')
     : '（空）');
+  var me = Array.isArray(e.model_effort) ? e.model_effort : [];
+  kvLine(host, 'model_effort', me.length
+    ? me.map(function(r){ return r.model + ' = ' + r.effort; }).join('，')
+    : '（空）');
 }
 
 function renderDatalist(){
@@ -510,6 +594,7 @@ function render(){
   renderWatcher();
   renderDefaultEffort();
   renderEffortMap();
+  renderModelEffort();
   renderCtx();
   renderModelMap();
   renderEnv();
@@ -536,6 +621,8 @@ function submit(url, body, okMsg){
     } else {
       state = res;                                        // 其余接口返回最新完整 GET 结构
       mapDraft = null;                                    // 映射以服务端为准重建
+      meffDraft = null;
+      mmDraft = null;
       render();
       toast('ok', okMsg);
     }
@@ -590,14 +677,54 @@ document.getElementById('ctx-save').addEventListener('click', function(){
   submit('./config/ctx', { model: model, ctx: n }, '已设置 ' + model + ' 上限 ' + fmtCtx(n));
 });
 
-/* ---------- D 应用模型名映射 ---------- */
+/* ---------- D 应用模型名映射（diff 提交：修改/新增发 orig:new，删除发 orig:""） ---------- */
 document.getElementById('mm-apply').addEventListener('click', function(){
-  var raw = document.getElementById('mm-text').value.trim();
-  if (!raw) { toast('err', '请先填写映射（原始名:新名，每行一条）'); return; }
-  /* 换行与逗号统一拆成条目；条目格式（含英文冒号、不含空键值）由后端校验并把 error 原样回传 */
-  var items = raw.split(/[\n,]+/).map(function(s){ return s.trim(); }).filter(Boolean);
-  if (!items.length) { toast('err', '未解析出任何映射条目'); return; }
-  submit('./config/model-map', { map: items.join(',') }, '模型名映射已提交（共 ' + items.length + ' 条）');
+  var cur = (state && state.watcher && state.watcher.model_map) || {};
+  var next = {};
+  var bad = [];
+  mmRows().forEach(function(r){
+    var o = (r.orig || '').trim(), n = (r.new || '').trim();
+    if (!o) return;                                       // 占位空行
+    if (n.indexOf(':') !== -1 || o.indexOf(':') !== -1) { bad.push(o); return; }
+    if (n) next[o] = n;
+  });
+  if (bad.length) { toast('err', '条目内不能含冒号：' + bad.join('，')); return; }
+  /* 逐 key diff：新增/改名发新值；旧 key 不在 next 里 = 删除（发空串） */
+  var body = {};
+  var changed = 0;
+  Object.keys(next).forEach(function(k){
+    if (cur[k] !== next[k]) { body[k] = next[k]; changed++; }
+  });
+  Object.keys(cur).forEach(function(k){
+    if (!(k in next)) { body[k] = ''; changed++; }
+  });
+  if (!changed) { toast('ok', '模型名映射未变化'); return; }
+  submit('./config/model-map', body, '模型名映射已提交（' + changed + ' 项变更）');
+});
+
+/* ---------- D 添加映射行 ---------- */
+document.getElementById('mm-add').addEventListener('click', function(){
+  mmEdit().push({ orig: '', new: '' });
+  renderModelMap();
+});
+
+/* ---------- B3 按模型定制：增行 / 保存 ---------- */
+document.getElementById('meff-add').addEventListener('click', function(){
+  meffEdit().push({ model: '', effort: '' });
+  renderModelEffort();
+});
+document.getElementById('meff-save').addEventListener('click', function(){
+  /* 完整列表语义：模型名留空或强度=不定制 的行即删除/忽略该定制 */
+  var eff = meffRows()
+    .filter(function(r){ return (r.model || '').trim() && r.effort; })
+    .map(function(r){ return { model: r.model.trim(), effort: r.effort }; });
+  var cur = (state && Array.isArray(state.model_effort)) ? state.model_effort : [];
+  var same = eff.length === cur.length && eff.every(function(r, i){
+    return cur[i] && cur[i].model === r.model && cur[i].effort === r.effort;
+  });
+  if (same) { toast('ok', '按模型定制未变化'); return; }
+  submit('./config/effort', { model_effort: eff },
+    eff.length ? '已保存 ' + eff.length + ' 条按模型定制' : '已清空全部按模型定制');
 });
 
 /* ===================== 初始化 ===================== */

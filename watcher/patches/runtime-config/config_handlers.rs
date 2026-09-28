@@ -75,4 +75,3 @@ fn ui_config_routes() -> Router<Arc<AppState>> {
         .route("/_ui/config/ctx", post(ui_config_ctx))
         .route("/_ui/config/model-map", post(ui_config_model_map))
 }
-

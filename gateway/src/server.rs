@@ -501,11 +501,36 @@ async fn ui_models_sse() -> Response {
 /// Public (no auth) routes for the Logs page. The page itself is a static asset
 /// and the chat traffic it displays is already visible in the router's own
 /// access log, so these endpoints stay unauthenticated like the /_ui assets.
+///
+/// /_ui/logs/backends feeds the Logs page's provider column (port + GPU):
+/// the watcher registers workers with a `gpu` label when it knows which
+/// device an instance sits on; workers registered without one report null.
+async fn ui_logs_backends(State(state): State<Arc<AppState>>) -> Response {
+    let mut out: Vec<Value> = Vec::new();
+    for worker in state.context.worker_registry.get_all() {
+        let gpu = worker
+            .metadata()
+            .labels
+            .get("gpu")
+            .cloned()
+            .map(Value::String);
+        for model in worker.models() {
+            out.push(json!({
+                "url": worker.url(),
+                "model": model.id,
+                "gpu": gpu.clone(),
+            }));
+        }
+    }
+    Json(json!({"backends": out})).into_response()
+}
+
 fn ui_logs_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/_ui/logs", get(ui_logs))
         .route("/_ui/stats", get(ui_stats))
         .route("/_ui/logs/stream", get(ui_logs_stream))
+        .route("/_ui/logs/backends", get(ui_logs_backends))
 }
 
 // ============================================================================

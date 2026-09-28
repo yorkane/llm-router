@@ -74,9 +74,10 @@ code{font-family:var(--font-code);font-size:12px}
   background:var(--surface);overflow:auto;max-height:calc(100vh - 268px);scrollbar-gutter:stable}
 table{table-layout:fixed;width:100%;min-width:1040px;border-collapse:collapse;font-size:13px}
 /* 列宽沿用 opencodex logs 页：12/9/7/8/15/9/13/8/11/8 */
-col.c-time{width:12%} col.c-tok{width:9%} col.c-rate{width:7%} col.c-cost{width:8%}
-col.c-model{width:15%} col.c-effort{width:9%} col.c-provider{width:13%} col.c-status{width:8%}
-col.c-req{width:11%} col.c-dur{width:8%}
+/* 8 列：12/9/7/16/10/16/10/10 */
+col.c-time{width:12%} col.c-tok{width:9%} col.c-rate{width:7%}
+col.c-model{width:16%} col.c-effort{width:10%} col.c-provider{width:16%} col.c-status{width:10%}
+col.c-dur{width:10%}
 thead{position:sticky;top:0;z-index:1;background:var(--surface)}
 th{text-align:left;color:var(--muted);font-weight:500;font-size:12px;padding:9px 12px;
   border-bottom:1px solid var(--border);white-space:nowrap}
@@ -124,10 +125,10 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
 
 /* 窄屏隐藏 ~$ 与 提供方：col 上的 display:none 不生效，必须同时把宽度归零并重新分配 */
 @media (max-width:900px){
-  th.c-cost,td.c-cost,th.c-provider,td.c-provider{display:none}
-  col.c-cost,col.c-provider{width:0}
+  th.c-provider,td.c-provider{display:none}
+  col.c-provider{width:0}
   col.c-time{width:16%} col.c-tok{width:12%} col.c-rate{width:9%} col.c-model{width:22%}
-  col.c-effort{width:12%} col.c-status{width:9%} col.c-req{width:12%} col.c-dur{width:8%}
+  col.c-effort{width:14%} col.c-status{width:12%} col.c-dur{width:9%}
   table{min-width:640px}
   .stat{min-width:88px;padding:7px 10px}
 }
@@ -161,15 +162,14 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
   <div class="tbl-wrap" id="wrap">
     <table>
       <colgroup>
-        <col class="c-time"><col class="c-tok"><col class="c-rate"><col class="c-cost">
+        <col class="c-time"><col class="c-tok"><col class="c-rate">
         <col class="c-model"><col class="c-effort"><col class="c-provider"><col class="c-status">
-        <col class="c-req"><col class="c-dur">
+        <col class="c-dur">
       </colgroup>
       <thead>
         <tr>
           <th>时间</th><th class="num">Token 数</th><th class="num" title="按完整请求耗时计算的每秒输出 token">tok/s</th>
-          <th class="num c-cost" title="按网关配置的标价估算，并非实际扣费；价格缺失时不显示">~$</th>
-          <th>模型</th><th>推理强度</th><th class="c-provider">提供方</th><th>状态</th><th>请求</th><th class="num">耗时</th>
+          <th>模型</th><th>推理强度</th><th class="c-provider">提供方</th><th>状态</th><th class="num">耗时</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -206,6 +206,8 @@ var expanded = Object.create(null);  // seq -> true（重建后保持展开）
 var stats = null;
 var loadedOnce = false;
 var pendingNew = 0;                  // 暂停滚动期间新增的行数
+var backends = Object.create(null);  // worker host:port -> {gpu}（GET ./logs/backends）
+var lastBackendsAt = 0;              // backends 低频刷新（30s）
 
 var tbody = document.getElementById('tbody');
 var wrap = document.getElementById('wrap');
@@ -241,19 +243,32 @@ function fmtTok(r){                         // tok/s：整数；tokens_estimated
   if (v === null || v <= 0) return '<span class="dash">-</span>';
   return estMark(r) + String(Math.round(v));
 }
-function fmtCost(r){                        // ~$：定价任一为 null → 灰色「无法估算」
-  var pi = stats ? num(stats.price_in_per_mtok) : null;
-  var po = stats ? num(stats.price_out_per_mtok) : null;
-  if (pi === null || po === null) return '<span class="dash">无法估算</span>';
-  if (!hasUsage(r)) return '<span class="dash">-</span>';
-  var c = ((num(r.prompt_tokens) || 0) * pi + (num(r.completion_tokens) || 0) * po) / 1e6;
-  return '$' + c.toFixed(4);
-}
 function fmtEffort(r){                      // high → xhigh / 单值 / 灰色 -
   var a = r.requested_effort, b = r.effort;
   if (!a && !b) return '<span class="dash">-</span>';
   if (!a || !b || a === b) return esc(a || b);
   return esc(a) + ' &rarr; ' + esc(b);
+}
+/* 提供方单元格：provider 字段非空（openai 远端模式）原样显示；
+   本机 worker 显示「:端口 + GPU 号」（GPU 来自 /logs/backends 的 worker labels，
+   watcher 注册时带上；拿不到只显示端口）。
+   本机 sglang/vllm/llamacpp worker 的 provider 字段是后端类型名（sglang 等），
+   不是给人看的名字，所以只要 worker 出现在 backends 清单里就显示端口+GPU。 */
+function gpuOfWorker(url){
+  if (!url) return null;
+  var b = backends[url];
+  return b && b.gpu ? String(b.gpu) : null;
+}
+function providerText(r){
+  if (!r.worker) return '';
+  if (!backends[r.worker] && r.provider) return r.provider;
+  var port = r.worker.slice(r.worker.lastIndexOf(':'));
+  var gpu = gpuOfWorker(r.worker);
+  return port + (gpu ? ' gpu' + gpu : '');
+}
+function providerCell(r){
+  var t = providerText(r);
+  return '<td class="c-provider muted">' + (t ? esc(t) : '<span class="dash">-</span>') + '</td>';
 }
 function effortPlain(r){
   var a = r.requested_effort, b = r.effort;
@@ -272,16 +287,6 @@ function fmtDur(ms){
   if (ms === null) return '<span class="dash">-</span>';
   var s = ms + 'ms';
   return ms >= 3000 ? '<span class="bold">' + s + '</span>' : s;
-}
-/* 请求 ID 截断（规格示例 ocx-48dad9f8…）：截断长度按内容判定而不是盲取前 9 字符 ——
-   带命名空间前缀的 id（lmr-16hex / ocx-32hex）保留「前缀 + 8 位 hex」再补 …，
-   可读性最好；没有前缀的 id 退化为前 9 字符 + …。完整 id 在 title 与详情里。 */
-function shortId(id){
-  if (!id) return '<span class="dash">-</span>';
-  var s = String(id);
-  var m = /^([a-z][a-z0-9]*-)([0-9a-fA-F]{6,})$/i.exec(s);
-  var cut = m ? m[1] + m[2].slice(0, 8) : s.slice(0, 9);
-  return '<span class="reqid" title="' + esc(s) + '">' + esc(cut) + '…</span>';
 }
 function fmtUptime(sec){
   var s = Math.floor(sec), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
@@ -302,14 +307,12 @@ function cellsHtml(r){
     '<td class="c-time nowrap muted">' + fmtTime(r.ts_ms) + '</td>',
     '<td class="num c-tok">' + tokCell + '</td>',
     '<td class="num c-rate nowrap">' + fmtTok(r) + '</td>',
-    '<td class="num c-cost nowrap">' + fmtCost(r) + '</td>',
     '<td class="c-model model">' + (r.model ? esc(r.model) : '<span class="dash">-</span>') + '</td>',
     '<td class="c-effort nowrap">' + fmtEffort(r) + '</td>',
-    '<td class="c-provider muted">' + (r.provider ? esc(r.provider) : '<span class="dash">-</span>') + '</td>',
+    providerCell(r),
     '<td class="c-status"><span class="st"><span class="code ' + statusCls(r.status) + '">' +
       esc(String(r.status)) + '</span>' +
       '<button type="button" class="detail-btn" data-detail="' + r.seq + '">查看详情</button></span></td>',
-    '<td class="c-req muted">' + shortId(r.id) + '</td>',
     '<td class="num c-dur nowrap">' + fmtDur(num(r.duration_ms)) + '</td>'
   ].join('');
 }
@@ -376,7 +379,7 @@ function makeDetailRow(r){
   tr.className = 'detail';
   tr.dataset.detailFor = String(r.seq);
   var td = document.createElement('td');
-  td.colSpan = 10;
+  td.colSpan = 8;
   td.innerHTML = detailHtml(r);
   tr.appendChild(td);
   return tr;
@@ -544,7 +547,29 @@ function setConn(bad){ connBox.hidden = !bad; }
 function bumpBackoff(){ backoff = Math.min(backoff * 2, 30000); }
 function resetBackoff(){ backoff = 1000; }
 
+/* 低频拉一次后端清单（worker -> gpu）；GPU 标签晚到时需要整表重建让提供方列跟上 */
+function refreshBackends(force){
+  var now = Date.now();
+  if (!force && now - lastBackendsAt < 30000) return;
+  lastBackendsAt = now;
+  fetchJson('./logs/backends').then(function(r){
+    var next = Object.create(null);
+    var changed = false;
+    (r && Array.isArray(r.backends) ? r.backends : []).forEach(function(b){
+      if (!b || !b.url) return;
+      var url = b.url.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      var gpu = b.gpu == null ? null : String(b.gpu);
+      if (!backends[url]) changed = true;      // 新 worker 出现：提供方列要换口径
+      else if (backends[url].gpu !== gpu) changed = true;   // GPU 标签晚到/变化
+      next[url] = { gpu: gpu };
+    });
+    backends = next;
+    if (changed && rows.length) rebuild();   // GPU 信息到位/变化，刷新提供方列
+  }, function(){ /* 拉不到维持旧表，下次再试 */ });
+}
+
 function tick(){
+  refreshBackends(false);
   Promise.all([fetchJson('./logs?cursor=' + cursor + '&limit=1000'), fetchJson('./stats')])
     .then(function(res){
       setConn(false); resetBackoff();
@@ -590,11 +615,7 @@ function applyStats(s){
   var buffered = typeof s.buffered === 'number' ? s.buffered : rows.length;
   capacity = typeof s.capacity === 'number' ? s.capacity : capacity;
   bufBox.textContent = buffered + '/' + capacity;
-  // 定价到位后 ~$ 列需要从「无法估算」刷新：整表重建一次（罕见路径）
-  var priced = num(s.price_in_per_mtok) !== null && num(s.price_out_per_mtok) !== null;
-  if (priced !== lastPriced) { lastPriced = priced; rebuild(); }
 }
-var lastPriced = false;
 function resetAll(newStartedAt){
   rows = []; seen = Object.create(null); cursor = 0; expanded = Object.create(null);
   tbody.innerHTML = '';

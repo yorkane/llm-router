@@ -22,6 +22,8 @@ pub const ENV_DEFAULT_EFFORT: &str = "LMR_DEFAULT_EFFORT";
 pub const ENV_EFFORT_MAP: &str = "LMR_EFFORT_MAP";
 /// Env: per-model context caps, e.g. LMR_MODEL_CTX=qwen3-32b:32768,glm:8192
 pub const ENV_MODEL_CTX: &str = "LMR_MODEL_CTX";
+/// Env: per-model forced effort, e.g. LMR_MODEL_EFFORT=qwen3-32b:high,glm:none
+pub const ENV_MODEL_EFFORT: &str = "LMR_MODEL_EFFORT";
 /// Env: base URL of the llm-watcher control plane used for model renames.
 pub const ENV_WATCHER_URL: &str = "LMR_WATCHER_URL";
 
@@ -49,6 +51,9 @@ pub struct RuntimeConfig {
     pub effort_map: HashMap<String, String>,
     /// model id -> max context tokens the router will let through.
     pub model_ctx: HashMap<String, u64>,
+    /// model id -> forced effort applied to every request for that model
+    /// (whether or not the request carries a reasoning_effort).
+    pub model_effort: HashMap<String, String>,
 }
 
 impl RuntimeConfig {
@@ -76,10 +81,21 @@ impl RuntimeConfig {
                 Some((model.trim().to_string(), ctx))
             })
             .collect();
+        let model_effort = parse_pairs(std::env::var(ENV_MODEL_EFFORT).ok().as_deref())
+            .into_iter()
+            .filter_map(|(model, effort)| {
+                let effort = normalize_effort(Some(&effort))?;
+                if model.trim().is_empty() {
+                    return None;
+                }
+                Some((model.trim().to_string(), effort))
+            })
+            .collect();
         RuntimeConfig {
             default_effort,
             effort_map,
             model_ctx,
+            model_effort,
         }
     }
 
@@ -96,10 +112,17 @@ impl RuntimeConfig {
             .into_iter()
             .map(|(model, cap)| json!({"model": model, "ctx": cap}))
             .collect();
+        let mut meff: Vec<(&String, &String)> = self.model_effort.iter().collect();
+        meff.sort_by(|a, b| a.0.cmp(b.0));
+        let model_effort: Vec<Value> = meff
+            .into_iter()
+            .map(|(model, effort)| json!({"model": model, "effort": effort}))
+            .collect();
         json!({
             "default_effort": self.default_effort,
             "effort_map": effort_map,
             "model_ctx": model_ctx,
+            "model_effort": model_effort,
         })
     }
 }
@@ -221,6 +244,36 @@ impl RuntimeConfigStore {
             }
             cfg.effort_map = next;
         }
+        if let Some(entries) = patch.get("model_effort") {
+            let list = entries.as_array().ok_or_else(|| {
+                "model_effort must be an array of {model, effort}".to_string()
+            })?;
+            let mut next = HashMap::new();
+            for entry in list {
+                let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                if model.trim().is_empty() {
+                    continue;
+                }
+                let raw = entry
+                    .get("effort")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                    continue; // entry removed this override
+                }
+                let effort = normalize_effort(Some(trimmed)).ok_or_else(|| {
+                    format!(
+                        "unknown effort for {}: {} (want one of {})",
+                        model.trim(),
+                        trimmed,
+                        EFFORT_LEVELS.join(", ")
+                    )
+                })?;
+                next.insert(model.trim().to_string(), effort);
+            }
+            cfg.model_effort = next;
+        }
         self.write(cfg);
         Ok(self.read().snapshot())
     }
@@ -246,8 +299,20 @@ impl RuntimeConfigStore {
 
     /// --- hot-path readers (lock + immediate drop; never held across await) ---
 
-    pub fn request_effort(&self, requested: Option<&str>) -> Option<String> {
+    /// Effective effort for one request: a per-model override wins outright;
+    /// otherwise the requested value (rewritten by the effort map) or the
+    /// global default.
+    pub fn request_effort_for(
+        &self,
+        model: Option<&str>,
+        requested: Option<&str>,
+    ) -> Option<String> {
         let cfg = self.read();
+        if let Some(m) = model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(forced) = cfg.model_effort.get(m) {
+                return Some(forced.clone());
+            }
+        }
         match requested.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(v) => cfg
                 .effort_map
@@ -331,7 +396,11 @@ pub fn apply_effort_policy(payload: &mut Value) -> (Option<String>, Option<Strin
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    match store.request_effort(requested.as_deref()) {
+    let model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match store.request_effort_for(model.as_deref(), requested.as_deref()) {
         Some(effective) => {
             payload["reasoning_effort"] = json!(effective);
             (requested, Some(effective))
