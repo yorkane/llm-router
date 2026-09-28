@@ -433,13 +433,21 @@ def activity_probe(url, model_id, timeout=15.0, api_key=None):
     cheapest signal that the engine can still do its job.
 
     Deliberately conservative, because a false "dead" costs a working worker:
-      * connection refused, or a 5xx        -> dead   (process gone, or the engine says no)
-      * it simply did not answer in time    -> slow   -- a 262K-context worker deep in a
-        queue also does that, so it needs far more strikes than a 5xx (see
+      * connection refused/reset/unreachable -> dead  (the process is not there any more)
+      * 5xx                                  -> error -- the engine answers but says no,
+        and a model that is still loading says the same thing, so it shares the slow
+        budget rather than the short one
+      * it simply did not answer in time     -> slow  -- a 262K-context worker deep in a
+        queue also does that, so it needs far more strikes than a dead port (see
         --activity-slow-factor)
       * 404                                 -> unknown (no chat endpoint, or it rejects this
         model id; the process answers, so do not judge it)
       * anything else, including a 4xx the engine itself produced -> alive
+
+    Name the id the worker itself advertises, not the router's public id: a model_map
+    rename makes the public id unknown to the worker, and vLLM answers that with the one
+    verdict this probe never holds against anyone (measured on 21.k: vLLM 404s an unknown
+    model, sglang and llama.cpp accept any name).
     """
     import socket
     body = json.dumps({"model": model_id, "messages": [{"role": "user", "content": "ping"}],
@@ -451,9 +459,11 @@ def activity_probe(url, model_id, timeout=15.0, api_key=None):
                                  headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return "alive" if resp.status < 500 else "dead"
+            return "alive" if resp.status < 500 else "error"
     except urllib.error.HTTPError as exc:
-        return "unknown" if exc.code == 404 else ("dead" if exc.code >= 500 else "alive")
+        if exc.code == 404:
+            return "unknown"
+        return "error" if exc.code >= 500 else "alive"
     except (socket.timeout, TimeoutError):
         return "slow"
     except urllib.error.URLError as exc:
@@ -553,6 +563,9 @@ class Ledger:
         # to be counted from when inference stopped, not from when the socket went quiet.
         self.unresponsive_since: Dict[str, float] = {}
         self.warned: Set[str] = set()
+        # url -> consecutive failed chat probes. Persisted, because a daemon that keeps
+        # restarting must not keep handing a zombie worker a fresh strike budget.
+        self.strikes: Dict[str, int] = {}
         self.model_map: Dict[str, str] = {}
         self._load()
 
@@ -570,8 +583,12 @@ class Ledger:
         self.missing_since = {normalize_url(str(k)): float(v) for k, v in (data.get("missing_since") or {}).items()}
         self.unresponsive_since = {normalize_url(str(k)): float(v)
                                    for k, v in (data.get("unresponsive_since") or {}).items()}
+        self.strikes = {normalize_url(str(k)): int(v)
+                        for k, v in (data.get("strikes") or {}).items()
+                        if str(v).isdigit()}
         self.model_map = {str(k): str(v) for k, v in (data.get("model_map") or {}).items()}
-        LOG.info("ledger loaded: %d owned, %d protected", len(self.owned), len(self.protected))
+        LOG.info("ledger loaded: %d owned, %d protected, %d with strikes",
+                 len(self.owned), len(self.protected), len(self.strikes))
 
     def save(self):
         if self.read_only:      # --dry-run must leave no trace, not even a ledger
@@ -583,6 +600,7 @@ class Ledger:
             "owned": self.owned,
             "missing_since": self.missing_since,
             "unresponsive_since": self.unresponsive_since,
+            "strikes": self.strikes,
             "model_map": getattr(self, "model_map", {}),
             "updated_at": int(time.time()),
         }
@@ -650,8 +668,8 @@ class Reconciler:
         # Retrying every pass just churns; back off exponentially instead.
         self._add_fails: Dict[str, dict] = {}
         # url -> {"n": consecutive failed chat probes, "next": when to probe again}.
-        # In memory on purpose: after a watcher restart every worker gets a fresh set of
-        # strikes, which is the conservative direction (never delete on stale evidence).
+        # The count is persisted in the ledger (Ledger.strikes), because a daemon that
+        # keeps restarting must not keep handing a zombie worker a fresh strike budget.
         self._acts: Dict[str, dict] = {}
         self.stats = {"reconciles": 0, "adds": 0, "removes": 0, "discovered": 0,
                       "activity_unresponsive": 0, "activity_removes": 0, "last_error": ""}
@@ -819,7 +837,7 @@ class Reconciler:
 
         self.ledger.save()
         self._check_model_isolation(actual)
-        self._check_activity(actual)
+        self._check_activity(actual, discovered)
 
     # "Discovered" only means a socket answered /v1/models, and that outlives the model:
     # llama.cpp keeps serving the model list after the weights are gone, and a worker added
@@ -827,7 +845,23 @@ class Reconciler:
     # model from /v1/models only when its last worker entry is deleted, so a zombie
     # registration keeps the model advertised while every request for it fails. Ask each
     # pool member to generate one token, and evict the ones that stop doing it.
-    def _check_activity(self, actual):
+    def _probe_id(self, url, item, advertised):
+        """The model id to name in the activity probe for this worker.
+
+        Prefer what the worker itself advertises. The router's public id may be a
+        model_map rename, and a renamed vLLM worker answers that with a 404 -- the one
+        verdict this probe never holds against anyone, which would leave the worker
+        unjudgable for good instead of visibly unhealthy.
+        """
+        info = (advertised or {}).get(url)
+        models = getattr(info, "models", None) if info is not None else None
+        if models:
+            return str(models[0])
+        served = str((item.get("metadata") or {}).get("served_model_name") or "")
+        return served or str(item.get("model_id") or "")
+
+    def _check_activity(self, actual, infos=None):
+        advertised = {info.url: info for info in (infos or [])}
         cfg = self.cfg
         if not cfg.activity_probe or not actual:
             return
@@ -841,6 +875,7 @@ class Reconciler:
         # Forget anything that left the pool; a worker that comes back starts with clean eyes.
         for url in [u for u in self._acts if u not in actual]:
             self._acts.pop(url, None)
+            self.ledger.strikes.pop(url, None)
         for url in [u for u in self.ledger.unresponsive_since if u not in actual]:
             self.ledger.unresponsive_since.pop(url, None)
         for url, item in sorted(actual.items()):
@@ -848,10 +883,14 @@ class Reconciler:
                 continue      # judge only what we registered, if protected workers are exempt
             if not str(item.get("id") or ""):
                 continue      # nothing to delete, so nothing to decide about
-            model_id = str(item.get("model_id") or "")
+            model_id = self._probe_id(url, item, advertised)
             if not model_id or model_id == "unknown":
                 continue      # cannot address the model, so cannot probe it
             state = self._acts.get(url)
+            if state is None and self.ledger.strikes.get(url):
+                # Resume the strike count the previous process was holding (ledger).
+                state = {"n": int(self.ledger.strikes[url]), "next": now}
+                self._acts[url] = state
             if state is None:
                 # Stagger the first probes by port so a pool of N workers does not mean N
                 # simultaneous chat requests at the same instant. Deterministic on purpose:
@@ -867,6 +906,7 @@ class Reconciler:
             return
         for url, res in zip(due, self._probe_activity(due)):
             self._note_activity(url, res, actual)
+        self.ledger.save()      # persist strikes: a restart must not reset them
 
     def _probe_activity(self, due: Dict[str, str]):
         urls = list(due)
@@ -884,6 +924,7 @@ class Reconciler:
             if state["n"]:
                 LOG.info("%s generates again after %d failed probe(s)", url, state["n"])
             state["n"] = 0
+            self.ledger.strikes.pop(url, None)
             self.ledger.unresponsive_since.pop(url, None)
             self.ledger.warned.discard(url)
             return
@@ -895,8 +936,13 @@ class Reconciler:
         # hard failure needs activity_fail_threshold probes, a timeout needs that times
         # activity_slow_factor. Still finite, because a process that only accepts sockets and
         # never answers is the other way a model rots in the pool, and that one must go too.
-        need = cfg.activity_fail_threshold * (cfg.activity_slow_factor if result == "slow" else 1)
+        # A 5xx has innocent explanations a refused port does not: a model still loading
+        # answers 503, and so does an engine mid-reload. Both error and slow therefore get
+        # the multiplied budget; only "the socket is gone" keeps the short threshold.
+        lenient = result in ("slow", "error")
+        need = cfg.activity_fail_threshold * (cfg.activity_slow_factor if lenient else 1)
         state["n"] += 1
+        self.ledger.strikes[url] = state["n"]
         self.stats["activity_unresponsive"] += 1
         item = actual.get(url) or {}
         model_id = str(item.get("model_id") or "")
@@ -942,6 +988,7 @@ class Reconciler:
         self.ledger.owned.pop(url, None)
         self.ledger.missing_since.pop(url, None)
         self.ledger.unresponsive_since.pop(url, None)
+        self.ledger.strikes.pop(url, None)
         self.ledger.warned.discard(url)
         # A protected URL (from --worker-urls or added by hand) is one this daemon promised
         # never to touch -- and correspondingly never to re-add. Having just deleted it, that
@@ -1193,6 +1240,7 @@ def start_metrics(reconciler, port):
                 "llm_watcher_owned_workers %d" % len(rec.ledger.owned),
                 "llm_watcher_protected_workers %d" % len(rec.ledger.protected),
                 "llm_watcher_activity_unresponsive %d" % rec.stats["activity_unresponsive"],
+                "llm_watcher_activity_strikes %d" % sum(rec.ledger.strikes.values()),
                 "llm_watcher_activity_removes_total %d" % rec.stats["activity_removes"],
                 "llm_watcher_model_map_entries %d" % len(rec.cfg.model_map),
                 "llm_watcher_router_reachable %d" % (0 if rec.stats["last_error"] else 1),

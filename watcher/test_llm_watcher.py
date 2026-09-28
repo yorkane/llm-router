@@ -54,6 +54,7 @@ class Endpoint:
         # like a dead engine, "500" errors, "none" has no such endpoint (404) the way a plain
         # engine does, "hang" accepts the socket and never answers.
         self.chat = chat
+        self.seen = []            # model ids POSTed to /v1/chat/completions
         self.chats = 0
         srv = self
 
@@ -115,10 +116,11 @@ class Endpoint:
             def do_POST(self):
                 path = self.path.split("?")[0]
                 srv.calls.append(path)
+                body = b""
                 try:
                     n = int(self.headers.get("content-length") or 0)
                     if n:
-                        self.rfile.read(n)
+                        body = self.rfile.read(n)
                 except Exception:
                     pass
                 if path != "/v1/chat/completions":
@@ -135,6 +137,27 @@ class Endpoint:
                         pass
                 elif srv.chat == "500":
                     self._json({"error": "model load failed"}, 500)
+                elif srv.chat in ("strict", "strict-dead"):
+                    # vLLM answers 404 for a model id it does not serve, which is
+                    # what lets a model_map rename hide a dead worker behind the
+                    # probe exemption. strict-dead also refuses its own model.
+                    try:
+                        wanted = str(json.loads(body or b"{}").get("model", ""))
+                    except Exception:
+                        wanted = ""
+                    srv.seen.append(wanted)
+                    if wanted not in srv.models:
+                        self._json({"error": {"message": "The model " + wanted
+                               + " does not exist.", "type": "BadRequestError"}}, 404)
+                    elif srv.chat == "strict-dead":
+                        self.close_connection = True
+                        try:
+                            self.wfile.close()
+                        except Exception:
+                            pass
+                    else:
+                        self._json({"choices": [{"message": {"role": "assistant",
+                                             "content": "ok"}}]})
                 elif srv.chat == "hang":
                     threading.Event().wait(30)      # outlives the probe's own timeout
                     self._json({"choices": []})
@@ -1165,6 +1188,102 @@ class TestActivity(WatcherTestCase):
         self.assertEqual(args.activity_fail_threshold, 5)
         self.assertFalse(args.activity_protected)
         self.assertEqual(args.activity_slow_factor, 7)
+
+
+
+class TestActivityFixes(WatcherTestCase):
+    """Regressions for the audit fixes: the 5xx verdict, probing the advertised id
+    under a model_map rename, and strikes that survive a watcher restart."""
+
+    def _fast(self, **over):
+        over.setdefault("activity_interval", 0.0)
+        over.setdefault("activity_timeout", 2.0)
+        return over
+
+    def test_5xx_needs_the_multiplied_budget_not_the_short_one(self):
+        # A model that is still loading answers 5xx; the old code judged it with the
+        # same threshold as a refused port, which evicted workers mid-reload.
+        loading = self.server(models=["dup"], chat="500")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([loading.url, mate.url], router,
+                              **self._fast(activity_fail_threshold=1,
+                                           activity_slow_factor=99))
+        for _ in range(8):
+            rec.reconcile()
+        self.assertIn(loading.url, router.pool)
+        self.assertEqual(router.deleted, [])
+
+    def test_a_persistent_5xx_is_still_evicted(self):
+        # The leniency is a multiplier, not an exemption: an engine that keeps saying
+        # no must still leave the pool, or its model rots in /v1/models again.
+        broken = self.server(models=["dup"], chat="500")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        rec = self.reconciler([broken.url, mate.url], router,
+                              **self._fast(activity_fail_threshold=1,
+                                           activity_slow_factor=2))
+        for _ in range(12):
+            rec.reconcile()
+        self.assertNotIn(broken.url, router.pool)
+
+    def test_probe_names_the_advertised_id_under_a_rename(self):
+        # model_map renames raw-model -> public-model. A vLLM worker 404s any id it
+        # does not serve, so naming the public id would put every probe into the 404
+        # exemption and leave the worker unjudgable forever.
+        srv = self.server(models=["raw-model"], chat="strict")
+        router = FakeRouter()
+        rec = self.reconciler([srv.url], router,
+                              model_map={"raw-model": "public-model"},
+                              **self._fast(activity_protected=False))
+        for _ in range(4):
+            rec.reconcile()
+        self.assertIn(srv.url, router.pool)
+        self.assertTrue(srv.seen, "the chat probe never reached the worker")
+        self.assertNotIn("public-model", srv.seen)
+        self.assertIn("raw-model", srv.seen)
+
+    def test_renamed_worker_stays_evictable(self):
+        # Same rename, but the worker then dies for real: it must leave the pool
+        # instead of hiding behind the 404 exemption.
+        router = FakeRouter()
+        mate = self.server(models=["raw-model"])
+        srv = self.server(models=["raw-model"], chat="strict")
+        rec = self.reconciler([srv.url, mate.url], router,
+                              model_map={"raw-model": "public-model"},
+                              **self._fast(activity_fail_threshold=1,
+                                           activity_protected=False))
+        for _ in range(3):
+            rec.reconcile()
+        self.assertIn(srv.url, router.pool)
+        srv.chat = "strict-dead"          # still 404s unknown ids, refuses its own
+        for _ in range(8):
+            rec.reconcile()
+        self.assertNotIn(srv.url, router.pool)
+        self.assertIn(mate.url, router.pool)
+
+    def test_strikes_survive_a_watcher_restart(self):
+        # A crash-looping watcher used to hand a zombie worker a fresh strike budget
+        # on every restart; the count must come back from the ledger instead.
+        sick = self.server(models=["dup"], chat="refuse")
+        mate = self.server(models=["dup"])
+        router = FakeRouter()
+        state = os.path.join(self._tmp, "state-restart")
+        kw = dict(remove_grace=0.0, add_confirm_timeout=600.0, activity_interval=0.0,
+                  activity_timeout=2.0, activity_fail_threshold=3,
+                  activity_slow_factor=1)
+        first = W.Reconciler(make_cfg(state, [sick.url, mate.url], **kw))
+        first.router = router
+        for _ in range(4):
+            first.reconcile()
+        self.assertEqual(first._acts[sick.url]["n"], 2)      # one strike still owed
+        self.assertEqual(first.ledger.strikes.get(sick.url), 2)
+        self.assertEqual(router.deleted, [])
+        second = W.Reconciler(make_cfg(state, [sick.url, mate.url], **kw))
+        second.router = router
+        second.reconcile()      # learns the schedule
+        second.reconcile()      # one more probe resumes at 2 -> threshold 3 -> evicted
+        self.assertNotIn(sick.url, router.pool)
 
 
 if __name__ == "__main__":

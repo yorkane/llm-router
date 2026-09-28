@@ -38,7 +38,7 @@ never as a routing decision.
 | Survives a router restart | Recorded worker ids are refreshed from `GET /workers`, otherwise a later `DELETE` would 404. |
 | Warns on mixed models | A single-router `smg` ignores the requested model when choosing a worker (measured: 10/10 requests naming the local model were served by a remote one, both returning 200). The daemon cannot fix that, so it logs one warning pointing at `--enable-igw` as soon as a second model appears. |
 | Blind by design | It never reads model files or GPU state, and never starts or stops a service. |
-| Probes that it really generates | Every pooled worker is asked, once a minute, to generate a single token. /v1/models outlives the model (llama.cpp keeps serving the list after the weights are gone, and a worker added with `disable_health_check` is never checked by the router at all), and the router only drops a model from /v1/models when its last worker entry is gone, so a zombie registration keeps a dead model advertised forever. Connection refused or a 5xx counts as a strike, and `--activity-fail-threshold` strikes in a row (default 3) evict it; a probe that merely times out needs `--activity-fail-threshold x --activity-slow-factor` (default x3) strikes, because a 262K worker deep in a queue also answers slowly. A 404 means the engine has no chat endpoint and is never held against it. |
+| Probes that it really generates | Every pooled worker is asked, once a minute, to generate a single token. /v1/models outlives the model (llama.cpp keeps serving the list after the weights are gone, and a worker added with `disable_health_check` is never checked by the router at all), and the router only drops a model from /v1/models when its last worker entry is gone, so a zombie registration keeps a dead model advertised forever. Connection refused counts as a strike and `--activity-fail-threshold` strikes in a row (default 3) evict it; a 5xx or a timeout needs `--activity-fail-threshold x --activity-slow-factor` (default x3) strikes, because a model that is still loading answers 5xx and a 262K worker deep in a queue answers slowly. The probe names the id the worker itself advertises, so a model-map rename cannot hide a dead worker behind a 404. A 404 means the engine has no chat endpoint and is never held against it. Strike counts persist in the ledger, so a restarting watcher does not hand a zombie a fresh budget. |
 | Hands over what it evicts | Evicting a worker that came from `--worker-urls` (a `protected` URL, which the watcher would otherwise never re-add) transfers its ownership to the watcher, so the container returns to the pool on its own as soon as it generates again. |
 
 ## Run it
@@ -139,7 +139,7 @@ process.
 
 ## State and metrics
 
-The ledger is `--state-dir/ledger.json` (`protected`, `owned`, `missing_since`). Deleting it
+The ledger is `--state-dir/ledger.json` (`protected`, `owned`, `missing_since`, `strikes`). Deleting it
 is safe but forgets the protection snapshot, so only do that against an empty pool. With
 `--metrics-port` a small Prometheus endpoint exposes `llm_watcher_adds_total`,
 `removes_total`, `discovered_workers`, `owned_workers`, `protected_workers`,
