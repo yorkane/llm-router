@@ -25,6 +25,11 @@ services:
       # through its metrics-port control plane. Effort/ctx baselines live here
       # too if you want them baked in, e.g. LMR_EFFORT_MAP: "high:xhigh".
       LMR_WATCHER_URL: "http://127.0.0.1:9912"
+      # Everything the Config page writes (effort policy + per-model cards) is
+      # persisted as JSON at this path and reloaded at startup, so UI edits
+      # survive a recreate. Unset = memory-only (edits revert to the env
+      # baseline on restart). Keep the directory on a volume/bind mount.
+      LMR_CONFIG_FILE: "/etc/llm-router/config.json"
       # LMR_DEFAULT_EFFORT: "high"
       # LMR_MODEL_CTX: "qwen3-32b:32768"
     # --enable-igw is required: the watcher will register workers that serve
@@ -71,6 +76,9 @@ services:
       - "/usr/local/share/llama-ui"
       - "--log-level"
       - "info"
+    volumes:
+      # persistent home for LMR_CONFIG_FILE (the router runs as root here)
+      - "/data/app/llm-router/config:/etc/llm-router"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8800/health"]
       interval: 30s

@@ -36,6 +36,7 @@
 | `LMR_MODEL_EFFORT_MAP` | 按模型思考强度映射，`model:from>to` 条目，多条用逗号/分号/换行分隔 | `qwen3-32b:high>xhigh,gpt:minimal>low` |
 | `LMR_MODEL_MODALITIES` | 按模型能力白名单，`model:text+image`（级别 `text`、`image`、`video`、`audio`，`text` 恒含），分隔同上 | `qwen3:text+image,other:text` |
 | `LMR_WATCHER_URL` | llm-watcher 控制面 base URL（metrics 端口），改名走它 | `http://127.0.0.1:9912` |
+| `LMR_CONFIG_FILE` | 配置落盘路径；设置后每次 UI/API 改动都写这个 JSON 文件，启动时优先加载它。未设置 = 纯内存（历史行为） | `/etc/llm-router/config.json` |
 
 解析规则（`runtime_config.rs`）：档位 trim + 小写后必须落在 `EFFORT_LEVELS`
 `none minimal low medium high xhigh max ultra`（8 档）内；`null`、`default`、空串一律视为
@@ -49,10 +50,19 @@
 `LMR_MODEL_EFFORT_MAP`（model:from>to）、`LMR_MODEL_MODALITIES`（model:cap+cap）；
 不存在其它写法（尤其没有 `model:from:to` 形式的 effort 映射）。
 
-**优先级与持久化语义：env 是启动基线**，进程启动时装入一次 store；之后所有 UI/API 改动
-**只改内存、不落盘，重启后以 env 为准**。GET `/_ui/config` 的 `env_defaults` 字段回显启动时的
-env 快照（Config 页只读面板），方便对照「当前值 vs 启动值」的漂移。唯一持久化的是模型改名
-（存在 watcher ledger，见 §6）。
+**优先级与持久化语义**分两种模式：
+
+- **设置了 `LMR_CONFIG_FILE`（推荐）**：启动时先加载该 JSON 文件（形状与 snapshot 相同，
+  复用同一套校验；文件缺失直接用 env 基线，文件损坏或非法则回落 env 并打 warn），之后每一次
+  UI/API 改动都同步**原子落盘**（同目录写隐藏 tmp 再 rename）。UI 编辑从此跨重启保留，env 只在
+  文件不存在时充当初始基线。容器部署把该目录挂成卷或 bind mount（仓库
+  `deploy/docker-compose.yml` 默认 `/data/app/llm-router/config:/etc/llm-router`，
+  env 指向容器内路径）。GET `/_ui/config` 的 `persist.file` 回显落盘路径，Config 页
+  顶部状态条同步显示「持久化 ● <路径>」或「未启用（内存态）」。
+- **未设置（历史行为）**：改动只进内存，重启后回到 env 基线。
+
+两种模式下 `env_defaults` 都回显启动时的 env 快照（Config 页只读面板），方便对照「当前值 vs
+启动值」的漂移。模型改名始终存在 watcher ledger（见 §6），与这里的落盘无关。
 
 ## 3. API 契约
 
@@ -300,7 +310,11 @@ watcher 与 router 同项目同 host 网络，控制面就是 watcher 的 metric
       LMR_MODEL_EFFORT_MAP: "qwen3-32b:high>xhigh"
       LMR_MODEL_MODALITIES: "qwen3-32b:text+image"
       LMR_WATCHER_URL: "http://127.0.0.1:9912"
+      LMR_CONFIG_FILE: "/etc/llm-router/config.json"
+    volumes:
+      - "/data/app/llm-router/config:/etc/llm-router"   # UI 改动落盘在这里
 ```
 
-env 只兜底「重启后的默认值」；日常调整全部可以在 Config 页完成。改动的逐请求效果
-（requested vs effective）到 Logs 页核对。
+env 是文件不存在时的初始基线；日常调整全部在 Config 页完成，改动实时落盘、重启自动恢复。
+需要跨实例复制或固化到镜像时，用 Config 页的 JSON 视图导出这份文件（apply 是整体替换语义，
+导出改回贴等价于固化）。改动的逐请求效果（requested vs effective）到 Logs 页核对。

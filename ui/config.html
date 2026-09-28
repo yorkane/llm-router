@@ -82,6 +82,7 @@ code{font-family:var(--font-code);font-size:12px}
 .statusbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 14px;
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:8px 14px}
 .statusbar .lbl{color:var(--muted);font-size:12px}
+.statusbar .grow{flex:1}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--gray);flex:none}
 .dot.ok{background:var(--green)} .dot.bad{background:var(--red)} .dot.off{background:var(--gray)}
 .statusbar .val{font-size:12px;color:var(--text)}
@@ -200,6 +201,10 @@ details.env .body{margin-top:10px}
     <span class="dot off" id="w-dot"></span>
     <span class="val mut" id="w-val">加载中…</span>
     <span class="url" id="w-url"></span>
+    <span class="grow"></span>
+    <span class="lbl">持久化</span>
+    <span class="dot off" id="p-dot"></span>
+    <span class="val mut" id="p-val">检测中…</span>
   </div>
 
   <!-- ============ 表单视图 ============ -->
@@ -208,7 +213,8 @@ details.env .body{margin-top:10px}
     <!-- A. 思考强度（全局） -->
     <section class="card">
       <h2>思考强度（全局）</h2>
-      <p class="desc">作用于网关对 <code>reasoning_effort</code> 的注入与改写；改动立即生效，重启后回到环境默认。
+      <p class="desc">作用于网关对 <code>reasoning_effort</code> 的注入与改写；改动立即生效，并在网关配置了
+        <code>LMR_CONFIG_FILE</code> 时落盘（重启自动恢复，见上方状态条「持久化」）。
         单个模型的默认强度与专属映射请在下方「模型配置」里按卡定制。</p>
 
       <div class="field">
@@ -408,6 +414,16 @@ function syncSelect(sel, v){
 }
 
 /* ---------- 状态条 ---------- */
+function renderPersist(){
+  var dot = document.getElementById('p-dot');
+  var val = document.getElementById('p-val');
+  if (!dot || !val) return;
+  var file = state && state.persist ? state.persist.file : null;
+  dot.className = 'dot'; val.className = 'val';
+  if (file) { dot.classList.add('ok'); val.textContent = file; }
+  else { dot.classList.add('off'); val.classList.add('mut'); val.textContent = '未启用（内存态，重启回环境默认）'; }
+}
+
 function renderWatcher(){
   var dot = document.getElementById('w-dot');
   var val = document.getElementById('w-val');
@@ -1137,6 +1153,7 @@ document.getElementById('json-apply').addEventListener('click', function(){
 /* ===================== 渲染主入口 ===================== */
 function render(){
   renderWatcher();
+  renderPersist();
   renderDefaultEffort();
   renderEffortMap();
   renderCards();

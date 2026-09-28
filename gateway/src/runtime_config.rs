@@ -31,6 +31,10 @@ pub const ENV_MODEL_MODALITIES: &str = "LMR_MODEL_MODALITIES";
 /// Env: base URL of the llm-watcher control plane used for model renames.
 pub const ENV_WATCHER_URL: &str = "LMR_WATCHER_URL";
 
+/// Env: path of the JSON file where the Config page state is persisted. An
+/// unset value disables persistence (memory-only, the historical behaviour).
+pub const ENV_CONFIG_FILE: &str = "LMR_CONFIG_FILE";
+
 /// Values the effort picker understands (also what the Config page lists).
 pub const EFFORT_LEVELS: [&str; 8] =
     ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -323,6 +327,8 @@ pub struct RuntimeConfigStore {
     current: RwLock<RuntimeConfig>,
     env_defaults: Value,
     watcher_url: Option<String>,
+    /// Path where every mutation is persisted, None = memory-only.
+    config_file: Option<std::path::PathBuf>,
 }
 
 impl RuntimeConfigStore {
@@ -333,10 +339,44 @@ impl RuntimeConfigStore {
             .ok()
             .map(|v| v.trim().trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty());
+        let config_file = std::env::var(ENV_CONFIG_FILE)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from);
+        let current = match config_file.as_deref() {
+            None => from_env,
+            Some(path) => match load_persisted(path) {
+                Ok(Some(snapshot)) => match Self::from_snapshot(&snapshot) {
+                    Ok(cfg) => {
+                        tracing::info!("runtime config loaded from {}", path.display());
+                        cfg
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "persisted config {} invalid ({}); falling back to env defaults",
+                            path.display(),
+                            e
+                        );
+                        from_env
+                    }
+                },
+                Ok(None) => from_env,
+                Err(e) => {
+                    tracing::warn!(
+                        "persisted config {} unreadable ({}); falling back to env defaults",
+                        path.display(),
+                        e
+                    );
+                    from_env
+                }
+            },
+        };
         Arc::new(Self {
-            current: RwLock::new(from_env),
+            current: RwLock::new(current),
             env_defaults,
             watcher_url,
+            config_file,
         })
     }
 
@@ -356,7 +396,12 @@ impl RuntimeConfigStore {
     }
 
     fn write(&self, cfg: RuntimeConfig) {
-        *self.current.write().unwrap_or_else(|e| e.into_inner()) = cfg;
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+        if let Some(path) = self.config_file.as_deref() {
+            if let Err(e) = persist(path, &cfg.snapshot()) {
+                tracing::warn!("runtime config persist to {} failed: {}", path.display(), e);
+            }
+        }
     }
 
     /// Full document for the Config page, including the watcher's rename table.
@@ -374,6 +419,9 @@ impl RuntimeConfigStore {
             "url": self.watcher_url,
             "reachable": reachable,
             "model_map": model_map,
+        });
+        doc["persist"] = json!({
+            "file": self.config_file.as_ref().map(|p| p.display().to_string()),
         });
         doc
     }
@@ -605,6 +653,15 @@ impl RuntimeConfigStore {
     /// anything is written, so a typo in one model card cannot leave the store
     /// half-applied.
     pub fn apply_document(&self, patch: &Value) -> Result<Value, String> {
+        let next = Self::from_document(patch)?;
+        self.write(next);
+        Ok(self.read().snapshot())
+    }
+
+    /// Validate a whole config document into a detached RuntimeConfig. Shared
+    /// by the JSON view (apply) and the on-disk loader at startup, so a stale
+    /// or hand-edited file can never install a half-valid policy.
+    pub fn from_document(patch: &Value) -> Result<RuntimeConfig, String> {
         if !patch.is_object() {
             return Err("body must be a JSON object".to_string());
         }
@@ -720,8 +777,12 @@ impl RuntimeConfigStore {
             }
             next.model_configs = built;
         }
-        self.write(next);
-        Ok(self.read().snapshot())
+        Ok(next)
+    }
+
+    /// Load a persisted snapshot (same shape as snapshot()).
+    pub fn from_snapshot(value: &Value) -> Result<RuntimeConfig, String> {
+        Self::from_document(value)
     }
 
     /// Registered models (id -> worker urls) merged with the config cards, for
@@ -862,4 +923,30 @@ pub fn apply_ctx_cap(payload: &mut Value, model: &str) -> Option<u64> {
         }
     }
     Some(cap)
+}
+
+/// Serialize + atomically replace the persisted config file.
+fn persist(path: &std::path::Path, snapshot: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(snapshot).map_err(|e| e.to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("config.json");
+    let tmp = path.with_file_name(format!(".{}.tmp", file_name));
+    std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
+        .map_err(|e| format!("create dir: {}", e))?;
+    std::fs::write(&tmp, text).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+fn load_persisted(path: &std::path::Path) -> Result<Option<Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
