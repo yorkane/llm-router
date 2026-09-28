@@ -133,6 +133,9 @@ python3 "$ROOT/watcher/patches/request-log/apply_request_log.py" "$GATEWAY" "$RO
 
 # --- local patch: runtime config (/_ui/config, hot-mutable effort/ctx) -----
 python3 "$ROOT/watcher/patches/runtime-config/apply_runtime_config.py" "$GATEWAY" "$ROOT/watcher/patches/runtime-config"
+
+# --- local patch: ui router mode (webui model picker, role:"router") -------
+python3 "$ROOT/watcher/patches/ui-router-mode/apply_ui_router_mode.py" "$GATEWAY" "$ROOT/watcher/patches/ui-router-mode"
 echo "$TARGET_REF" > "$REF_FILE"
 log "gateway/ updated to upstream $TARGET_REF"
 
