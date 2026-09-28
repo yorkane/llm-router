@@ -182,7 +182,7 @@ strip = true        # Strip debug symbols
 inherits = "release"
 opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
 lto = "thin"        # Thin LTO - good balance
-codegen-units = 16  # More parallelization for faster builds
+codegen-units = 64  # Many CGUs: keep all cores busy during ci builds
 strip = true
 
 [profile.dev]
