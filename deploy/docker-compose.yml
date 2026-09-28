@@ -20,6 +20,13 @@ services:
     network_mode: host
     restart: unless-stopped
     shm_size: 64m
+    environment:
+      # Config page (/_ui/config): model renames are applied by the watcher
+      # through its metrics-port control plane. Effort/ctx baselines live here
+      # too if you want them baked in, e.g. LMR_EFFORT_MAP: "high:xhigh".
+      LMR_WATCHER_URL: "http://127.0.0.1:9912"
+      # LMR_DEFAULT_EFFORT: "high"
+      # LMR_MODEL_CTX: "qwen3-32b:32768"
     # --enable-igw is required: the watcher will register workers that serve
     # DIFFERENT model ids (the 8065 dflash build vs the 8012/8013 qwen), and
     # without IGW the single-router ignores the requested model and would
