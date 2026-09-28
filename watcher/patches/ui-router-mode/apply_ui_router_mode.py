@@ -52,7 +52,8 @@ def swap(t, a, b, path, name):
     return t.replace(a, b)
 
 
-# 1) the two helper fns (ui_router_mode / ui_props_with_role), inserted ahead
+# 1) the helper fns (ui_router_mode / ui_props_with_modalities / ui_props_with_role),
+#    inserted ahead
 #    of the runtime-config ctx-cap fn doc comment
 t = swap(
     t,
@@ -68,7 +69,10 @@ t = swap(
 t = swap(
     t,
     "                            ui_props_with_thinking(value),\n",
-    "                            ui_props_with_role(ui_props_with_thinking(value)),\n",
+    "                            ui_props_with_role(ui_props_with_modalities(\n"
+    "                                ui_props_with_thinking(value),\n"
+    "                                cap_model.as_deref(),\n"
+    "                            )),\n",
     SV,
     "props-call-site",
 )
@@ -81,11 +85,14 @@ t = swap(
     '            "model_alias": null,\n'
     '            "webui_version": "llm-router",\n'
     "        })),\n",
-    "        ui_props_with_role(ui_props_with_thinking(json!({\n"
-    '            "model_path": model_path,\n'
-    '            "model_alias": null,\n'
-    '            "webui_version": "llm-router",\n'
-    "        }))),\n",
+    "        ui_props_with_role(ui_props_with_modalities(\n"
+    "            ui_props_with_thinking(json!({\n"
+    '                "model_path": model_path,\n'
+    '                "model_alias": null,\n'
+    '                "webui_version": "llm-router",\n'
+    "            })),\n"
+    "            cap_model.as_deref(),\n"
+    "        )),\n",
     SV,
     "props-fallback",
 )

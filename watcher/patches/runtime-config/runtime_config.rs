@@ -24,12 +24,20 @@ pub const ENV_EFFORT_MAP: &str = "LMR_EFFORT_MAP";
 pub const ENV_MODEL_CTX: &str = "LMR_MODEL_CTX";
 /// Env: per-model forced effort, e.g. LMR_MODEL_EFFORT=qwen3-32b:high,glm:none
 pub const ENV_MODEL_EFFORT: &str = "LMR_MODEL_EFFORT";
+/// Env: per-model effort rewrites, e.g. LMR_MODEL_EFFORT_MAP=qwen:high>xhigh;qwen:low>medium
+pub const ENV_MODEL_EFFORT_MAP: &str = "LMR_MODEL_EFFORT_MAP";
+/// Env: per-model capability overrides, e.g. LMR_MODEL_MODALITIES=qwen:text+image,other:text
+pub const ENV_MODEL_MODALITIES: &str = "LMR_MODEL_MODALITIES";
 /// Env: base URL of the llm-watcher control plane used for model renames.
 pub const ENV_WATCHER_URL: &str = "LMR_WATCHER_URL";
 
 /// Values the effort picker understands (also what the Config page lists).
 pub const EFFORT_LEVELS: [&str; 8] =
     ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+/// Capability toggles the Config page exposes per model. ``text`` is always on;
+/// the others map onto the webui's modalities flags (image -> vision).
+pub const MODALITY_LEVELS: [&str; 4] = ["text", "image", "video", "audio"];
 
 pub fn normalize_effort(value: Option<&str>) -> Option<String> {
     let v = value?.trim().to_lowercase();
@@ -43,6 +51,21 @@ pub fn normalize_effort(value: Option<&str>) -> Option<String> {
     }
 }
 
+/// Everything the Config page can pin down for one model id: a context cap, a
+/// default effort (used when the request carries none, carries an unknown one,
+/// or a configured rewrite did not apply), a model-local effort rewrite table,
+/// and an explicit capability set. ``None`` on ctx/modalities/default_effort
+/// means "follow the worker / global config".
+#[derive(Clone, Default)]
+pub struct ModelConfig {
+    pub ctx: Option<u64>,
+    pub default_effort: Option<String>,
+    /// requested -> replacement, checked before the global effort map.
+    pub effort_map: HashMap<String, String>,
+    /// text/image/video/audio subset; None = auto-detect from the worker.
+    pub modalities: Option<Vec<String>>,
+}
+
 #[derive(Clone, Default)]
 pub struct RuntimeConfig {
     /// Injected when the request has no reasoning_effort at all.
@@ -52,8 +75,12 @@ pub struct RuntimeConfig {
     /// model id -> max context tokens the router will let through.
     pub model_ctx: HashMap<String, u64>,
     /// model id -> forced effort applied to every request for that model
-    /// (whether or not the request carries a reasoning_effort).
+    /// (whether or not the request carries a reasoning_effort). Legacy: the
+    /// Config page now edits ``model_configs``; LMR_MODEL_EFFORT still wins
+    /// while an entry is present, and saving a card clears it for that model.
     pub model_effort: HashMap<String, String>,
+    /// model id -> the per-model card (ctx / default effort / effort map / caps).
+    pub model_configs: HashMap<String, ModelConfig>,
 }
 
 impl RuntimeConfig {
@@ -91,12 +118,154 @@ impl RuntimeConfig {
                 Some((model.trim().to_string(), effort))
             })
             .collect();
+        // model:from>to ( ';' or ',' or newline separated, '>' between levels)
+        let mut per_model_effort_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (model, pair) in parse_pairs(std::env::var(ENV_MODEL_EFFORT_MAP).ok().as_deref()) {
+            let Some((from, to)) = pair.split_once('>') else {
+                continue;
+            };
+            let Some(from) = normalize_effort(Some(from.trim())) else {
+                continue;
+            };
+            let Some(to) = normalize_effort(Some(to.trim())) else {
+                continue;
+            };
+            if model.trim().is_empty() {
+                continue;
+            }
+            per_model_effort_map
+                .entry(model.trim().to_string())
+                .or_default()
+                .insert(from, to);
+        }
+        // model:cap1+cap2 (caps joined with '+')
+        let mut per_model_caps: HashMap<String, Vec<String>> = HashMap::new();
+        for (model, raw) in parse_pairs(std::env::var(ENV_MODEL_MODALITIES).ok().as_deref()) {
+            let mut caps: Vec<String> = raw
+                .split(['+', ',', ' '])
+                .map(|c| c.trim().to_lowercase())
+                .filter(|c| MODALITY_LEVELS.contains(&c.as_str()))
+                .collect();
+            caps.insert(0, "text".to_string());
+            caps.dedup();
+            if model.trim().is_empty() {
+                continue;
+            }
+            per_model_caps.insert(model.trim().to_string(), caps);
+        }
+        let mut model_configs: HashMap<String, ModelConfig> = HashMap::new();
+        for (model, map) in per_model_effort_map {
+            model_configs.entry(model).or_default().effort_map = map;
+        }
+        for (model, caps) in per_model_caps {
+            model_configs.entry(model).or_default().modalities = Some(caps);
+        }
         RuntimeConfig {
             default_effort,
             effort_map,
             model_ctx,
             model_effort,
+            model_configs,
         }
+    }
+
+    /// Merge one patch into a model card. Absent field = leave alone; JSON null
+    /// (or an empty list for modalities/effort_map) = clear it back to "auto".
+    fn merge_model_patch(current: &mut ModelConfig, patch: &Value) -> Result<(), String> {
+        if patch.get("ctx").is_some() {
+            current.ctx = match patch.get("ctx") {
+                Some(Value::Null) | None => None,
+                Some(Value::Number(n)) => match n.as_u64() {
+                    Some(0) | None => return Err("ctx must be greater than zero".to_string()),
+                    Some(v) => Some(v),
+                },
+                Some(Value::String(s)) => {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.parse::<u64>().map_err(|_| format!("ctx must be a number: {}", s))?)
+                    }
+                }
+                _ => return Err("ctx must be a number or null".to_string()),
+            };
+        }
+        if patch.get("default_effort").is_some() {
+            current.default_effort = match patch.get("default_effort") {
+                Some(Value::Null) => None,
+                Some(Value::String(s)) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                        None
+                    } else {
+                        match normalize_effort(Some(trimmed)) {
+                            Some(v) => Some(v),
+                            None => {
+                                return Err(format!(
+                                    "unknown effort for default_effort: {} (want one of {})",
+                                    trimmed,
+                                    EFFORT_LEVELS.join(", ")
+                                ))
+                            }
+                        }
+                    }
+                }
+                _ => return Err("default_effort must be a string or null".to_string()),
+            };
+        }
+        if let Some(entries) = patch.get("effort_map") {
+            if entries.is_null() {
+                current.effort_map.clear();
+            } else {
+                let list = entries
+                    .as_array()
+                    .ok_or_else(|| "effort_map must be an array".to_string())?;
+                let mut next = HashMap::new();
+                for entry in list {
+                    let from = entry.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                    let to = entry.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                    let Some(from) = normalize_effort(Some(from)) else {
+                        return Err(format!("unknown effort in map: {}", from));
+                    };
+                    if to.trim().is_empty() {
+                        continue; // deleting this row
+                    }
+                    let Some(to) = normalize_effort(Some(to.trim())) else {
+                        return Err(format!(
+                            "unknown effort in map target: {} (want one of {})",
+                            to.trim(),
+                            EFFORT_LEVELS.join(", ")
+                        ));
+                    };
+                    next.insert(from, to);
+                }
+                current.effort_map = next;
+            }
+        }
+        if patch.get("modalities").is_some() {
+            current.modalities = match patch.get("modalities") {
+                Some(Value::Null) => None,
+                Some(Value::Array(list)) => {
+                    let mut caps: Vec<String> = list
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|c| MODALITY_LEVELS.contains(&c.as_str()))
+                        .collect();
+                    if caps.is_empty() {
+                        // Explicit empty array means "text only", not "auto".
+                        Some(vec!["text".to_string()])
+                    } else {
+                        caps.insert(0, "text".to_string());
+                        caps.sort();
+                        caps.dedup();
+                        Some(caps)
+                    }
+                }
+                _ => return Err("modalities must be an array or null".to_string()),
+            };
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> Value {
@@ -118,11 +287,31 @@ impl RuntimeConfig {
             .into_iter()
             .map(|(model, effort)| json!({"model": model, "effort": effort}))
             .collect();
+        let mut mcfg: Vec<(&String, &ModelConfig)> = self.model_configs.iter().collect();
+        mcfg.sort_by(|a, b| a.0.cmp(b.0));
+        let model_configs: Vec<Value> = mcfg
+            .into_iter()
+            .map(|(model, c)| {
+                let mut map: Vec<(&String, &String)> = c.effort_map.iter().collect();
+                map.sort_by(|a, b| a.0.cmp(b.0));
+                json!({
+                    "model": model,
+                    "ctx": c.ctx,
+                    "default_effort": c.default_effort,
+                    "effort_map": map
+                        .into_iter()
+                        .map(|(from, to)| json!({"from": from, "to": to}))
+                        .collect::<Vec<Value>>(),
+                    "modalities": c.modalities,
+                })
+            })
+            .collect();
         json!({
             "default_effort": self.default_effort,
             "effort_map": effort_map,
             "model_ctx": model_ctx,
             "model_effort": model_effort,
+            "model_configs": model_configs,
         })
     }
 }
@@ -299,32 +488,284 @@ impl RuntimeConfigStore {
 
     /// --- hot-path readers (lock + immediate drop; never held across await) ---
 
-    /// Effective effort for one request: a per-model override wins outright;
-    /// otherwise the requested value (rewritten by the effort map) or the
-    /// global default.
+    /// Effective effort for one request.
+    ///
+    /// Order: a legacy forced override (LMR_MODEL_EFFORT / model_effort) wins
+    /// while present; then the model card -- its own rewrite table, falling back
+    /// to the card default when the requested level is unknown to that model or
+    /// when the rewrite did not apply; then the global map + global default.
     pub fn request_effort_for(
         &self,
         model: Option<&str>,
         requested: Option<&str>,
     ) -> Option<String> {
         let cfg = self.read();
-        if let Some(m) = model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let model_key = model.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let card = model_key.and_then(|m| cfg.model_configs.get(m));
+        if let Some(m) = model_key {
             if let Some(forced) = cfg.model_effort.get(m) {
                 return Some(forced.clone());
             }
         }
-        match requested.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            Some(v) => cfg
-                .effort_map
-                .get(v)
-                .cloned()
-                .or_else(|| Some(v.to_string())),
+        let wanted = requested
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty() && s != "null" && s != "default");
+        if let Some(card) = card {
+            match wanted.as_deref().and_then(|v| normalize_effort(Some(v))) {
+                Some(level) => {
+                    if let Some(mapped) = card.effort_map.get(level.as_str()) {
+                        return Some(mapped.clone());
+                    }
+                    // The card exists and declares mappings that did not match,
+                    // or the level is not a level at all: use the model default.
+                    if !card.effort_map.is_empty() || card.default_effort.is_some() {
+                        return Some(card.default_effort.clone().unwrap_or_else(|| level.to_string()));
+                    }
+                    return Some(cfg.effort_map.get(level.as_str()).cloned().unwrap_or_else(|| level.to_string()));
+                }
+                // Request omitted the field (or sent null): model default first.
+                None => {
+                    if card.default_effort.is_some() {
+                        return card.default_effort.clone();
+                    }
+                    if wanted.is_some() {
+                        // Unparseable value from the client: do not forward junk.
+                        return Some(
+                            card.default_effort
+                                .clone()
+                                .or_else(|| cfg.default_effort.clone())
+                                .unwrap_or_else(|| wanted.clone().unwrap()),
+                        );
+                    }
+                    return cfg.default_effort.clone();
+                }
+            }
+        }
+        match wanted {
+            Some(v) => cfg.effort_map.get(&v).cloned().or(Some(v)),
             None => cfg.default_effort.clone(),
         }
     }
 
+    /// Context cap for a model: the card wins over the legacy LMR_MODEL_CTX map.
     pub fn ctx_cap(&self, model: &str) -> Option<u64> {
-        self.read().model_ctx.get(model).copied()
+        let cfg = self.read();
+        cfg.model_configs
+            .get(model)
+            .and_then(|c| c.ctx)
+            .or_else(|| cfg.model_ctx.get(model).copied())
+    }
+
+    /// Capability override for a model; None = let the worker answer for itself.
+    pub fn modalities_for(&self, model: &str) -> Option<Vec<String>> {
+        self.read()
+            .model_configs
+            .get(model)
+            .and_then(|c| c.modalities.clone())
+    }
+
+    /// Apply one model-card patch. Absent fields are untouched; `remove: true`
+    /// drops the whole card. Saving a card also clears the legacy forced-effort
+    /// entry for that model so the card is the single source of truth.
+    pub fn apply_model_config(&self, patch: &Value) -> Result<Value, String> {
+        let model = patch
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if model.is_empty() {
+            return Err("model is required".to_string());
+        }
+        let mut cfg = self.read();
+        if patch.get("remove").and_then(|v| v.as_bool()).unwrap_or(false) {
+            cfg.model_configs.remove(&model);
+            cfg.model_ctx.remove(&model);
+            cfg.model_effort.remove(&model);
+            self.write(cfg);
+            return Ok(self.read().snapshot());
+        }
+        let mut card = cfg.model_configs.get(&model).cloned().unwrap_or_default();
+        RuntimeConfig::merge_model_patch(&mut card, patch)?;
+        if patch.get("default_effort").is_some() {
+            cfg.model_effort.remove(&model);
+        }
+        if patch.get("ctx").is_some() {
+            cfg.model_ctx.remove(&model);
+        }
+        cfg.model_configs.insert(model, card);
+        self.write(cfg);
+        Ok(self.read().snapshot())
+    }
+
+    /// Whole-document replace used by the Config page's JSON editor: every
+    /// section is rebuilt from the payload and absent sections are cleared,
+    /// which is what makes the JSON view a faithful source of truth rather than
+    /// a patch overlay. Everything is validated into a detached config before
+    /// anything is written, so a typo in one model card cannot leave the store
+    /// half-applied.
+    pub fn apply_document(&self, patch: &Value) -> Result<Value, String> {
+        if !patch.is_object() {
+            return Err("body must be a JSON object".to_string());
+        }
+        let mut next = RuntimeConfig::default();
+        if patch.get("default_effort").is_some() {
+            next.default_effort = match patch.get("default_effort") {
+                Some(Value::Null) => None,
+                Some(Value::String(s)) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                        None
+                    } else {
+                        match normalize_effort(Some(trimmed)) {
+                            Some(v) => Some(v),
+                            None => {
+                                return Err(format!("unknown default_effort: {}", trimmed));
+                            }
+                        }
+                    }
+                }
+                _ => return Err("default_effort must be a string or null".to_string()),
+            };
+        }
+        if let Some(entries) = patch.get("effort_map") {
+            let list = entries
+                .as_array()
+                .ok_or_else(|| "effort_map must be an array".to_string())?;
+            for entry in list {
+                let from = entry.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let to = entry.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(from) = normalize_effort(Some(from)) else {
+                    return Err(format!("unknown effort in effort_map: {}", from));
+                };
+                if to.trim().is_empty() {
+                    continue;
+                }
+                let Some(to) = normalize_effort(Some(to.trim())) else {
+                    return Err(format!(
+                        "unknown effort in effort_map target: {}",
+                        to.trim()
+                    ));
+                };
+                next.effort_map.insert(from, to);
+            }
+        }
+        if let Some(entries) = patch.get("model_ctx") {
+            let list = entries
+                .as_array()
+                .ok_or_else(|| "model_ctx must be an array".to_string())?;
+            for entry in list {
+                let model = entry
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if model.is_empty() {
+                    continue;
+                }
+                let ctx = entry
+                    .get("ctx")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| format!("model_ctx for {} needs a numeric ctx", model))?;
+                if ctx == 0 {
+                    return Err(format!(
+                        "model_ctx for {} must be greater than zero",
+                        model
+                    ));
+                }
+                next.model_ctx.insert(model.to_string(), ctx);
+            }
+        }
+        if let Some(entries) = patch.get("model_effort") {
+            let list = entries
+                .as_array()
+                .ok_or_else(|| "model_effort must be an array".to_string())?;
+            for entry in list {
+                let model = entry
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if model.is_empty() {
+                    continue;
+                }
+                let raw = entry.get("effort").and_then(|v| v.as_str()).unwrap_or("");
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                    continue;
+                }
+                let effort = normalize_effort(Some(trimmed))
+                    .ok_or_else(|| format!("unknown effort for {}", model))?;
+                next.model_effort.insert(model.to_string(), effort);
+            }
+        }
+        if let Some(entries) = patch.get("model_configs") {
+            let list = entries
+                .as_array()
+                .ok_or_else(|| "model_configs must be an array".to_string())?;
+            let mut built: HashMap<String, ModelConfig> = HashMap::new();
+            for entry in list {
+                let model = entry
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if model.is_empty() {
+                    return Err("every model_configs entry needs a model".to_string());
+                }
+                let mut card = ModelConfig::default();
+                RuntimeConfig::merge_model_patch(&mut card, entry)?;
+                built.insert(model, card);
+            }
+            next.model_configs = built;
+        }
+        self.write(next);
+        Ok(self.read().snapshot())
+    }
+
+    /// Registered models (id -> worker urls) merged with the config cards, for
+    /// the Config page. A name served by two providers is one card on purpose.
+    pub fn models_document(&self, registered: Vec<(String, String)>) -> Value {
+        let mut order: Vec<String> = Vec::new();
+        let mut sources: HashMap<String, Vec<String>> = HashMap::new();
+        for (model, url) in registered {
+            if !sources.contains_key(&model) {
+                order.push(model.clone());
+            }
+            sources.entry(model).or_default().push(url);
+        }
+        let cfg = self.read();
+        for model in cfg.model_configs.keys() {
+            if !sources.contains_key(model) {
+                order.push(model.clone());
+                sources.insert(model.clone(), Vec::new());
+            }
+        }
+        order.sort();
+        let models: Vec<Value> = order
+            .into_iter()
+            .map(|model| {
+                let card = cfg.model_configs.get(&model);
+                let mut map: Vec<(&String, &String)> = card
+                    .map(|c| c.effort_map.iter().collect())
+                    .unwrap_or_default();
+                map.sort_by(|a, b| a.0.cmp(b.0));
+                json!({
+                    "model": model,
+                    "registered": !sources[&model].is_empty(),
+                    "sources": sources[&model],
+                    "ctx": card.and_then(|c| c.ctx),
+                    "default_effort": card.and_then(|c| c.default_effort.clone()),
+                    "effort_map": map
+                        .into_iter()
+                        .map(|(from, to)| json!({"from": from, "to": to}))
+                        .collect::<Vec<Value>>(),
+                    "modalities": card.and_then(|c| c.modalities.clone()),
+                })
+            })
+            .collect();
+        json!(models)
     }
 }
 
