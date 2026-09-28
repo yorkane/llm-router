@@ -123,7 +123,31 @@ fn ui_props_with_thinking(mut value: Value) -> Value {
     value
 }
 
+/// Report the configured context cap instead of the worker's raw n_ctx when the
+/// Config page set one, so the webui's context slider cannot offer more than
+/// the router will actually forward (apply_ctx_cap clamps the request too).
+fn ui_props_with_ctx(value: Value, wanted: Option<&str>) -> Value {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    let Some(cap) = wanted.and_then(|m| store.ctx_cap(m)) else {
+        return value;
+    };
+    let mut value = value;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("n_ctx".to_string(), json!(cap));
+        let n_ctx_train = obj
+            .get("n_ctx_train")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(cap);
+        obj.insert(
+            "n_ctx_train".to_string(),
+            json!(n_ctx_train.max(cap)),
+        );
+    }
+    value
+}
+
 async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
+    let cap_model = wanted.clone();
     let candidates: Vec<Arc<dyn Worker>> = state
         .context
         .worker_registry
@@ -152,7 +176,11 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
             if resp.status().is_success() {
                 if let Ok(body) = resp.text().await {
                     if let Ok(value) = serde_json::from_str::<Value>(&body) {
-                        return Json(ui_props_with_thinking(value)).into_response();
+                        return Json(ui_props_with_ctx(
+                            ui_props_with_thinking(value),
+                            cap_model.as_deref(),
+                        ))
+                        .into_response();
                     }
                     return (StatusCode::OK, [("content-type", "application/json")], body)
                         .into_response();
@@ -167,11 +195,14 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
             .and_then(|w| w.models().first().map(|m| m.id.clone()))
             .unwrap_or_else(|| "unknown".to_string())
     });
-    Json(ui_props_with_thinking(json!({
-        "model_path": model_path,
-        "model_alias": null,
-        "webui_version": "llm-router",
-    })))
+    Json(ui_props_with_ctx(
+        ui_props_with_thinking(json!({
+            "model_path": model_path,
+            "model_alias": null,
+            "webui_version": "llm-router",
+        })),
+        cap_model.as_deref(),
+    ))
     .into_response()
 }
 
@@ -279,6 +310,172 @@ async fn v1_ui_unsupported() -> Response {
         Json(json!({"error": "llama.cpp server stream/control not available through the router"})),
     )
         .into_response()
+}
+
+// ============================================================================
+// Logs-page API for the llama.cpp webui: /_ui/logs, /_ui/stats, /_ui/logs/stream
+// ============================================================================
+
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures_util::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
+
+/// Query parameters for the paginated log endpoint.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LogsQuery {
+    /// Highest record sequence the caller has already seen; only newer rows are
+    /// returned. Omit for a full pull of the buffer.
+    pub cursor: Option<u64>,
+    /// Maximum rows per response (the store clamps to 2000).
+    pub limit: Option<usize>,
+}
+
+fn request_log_store() -> Option<&'static Arc<crate::observability::request_log::RequestLogStore>> {
+    crate::observability::request_log::RequestLogStore::current()
+}
+
+fn request_log_disabled() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "request log not enabled"})),
+    )
+        .into_response()
+}
+
+/// GET /_ui/logs?cursor=&limit= - the ring buffer as JSON, oldest first.
+async fn ui_logs(Query(query): Query<LogsQuery>) -> Response {
+    let Some(store) = request_log_store() else {
+        return request_log_disabled();
+    };
+    let (cursor, requests) = store.snapshot(query.cursor.unwrap_or(0), query.limit.unwrap_or(500));
+    Json(json!({
+        "cursor": cursor,
+        "capacity": store.capacity(),
+        "requests": requests,
+    }))
+    .into_response()
+}
+
+/// GET /_ui/stats - live counters for the summary strip: current concurrency,
+/// aggregate input/output token rates over a sliding window, and price settings.
+async fn ui_stats() -> Response {
+    let Some(store) = request_log_store() else {
+        return request_log_disabled();
+    };
+    Json(store.stats()).into_response()
+}
+
+/// GET /_ui/logs/stream - SSE fan-out of finished requests. A subscriber that
+/// falls behind only loses frames (Lagged) and heals on its next cursor poll, so
+/// the stream never needs to end on its own; the browser reconnects on drop.
+async fn ui_logs_stream() -> Response {
+    let Some(store) = request_log_store() else {
+        return request_log_disabled();
+    };
+    let rx = store.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|item| async move {
+        match item {
+            Ok(record) => Event::default()
+                .json_data(record)
+                .map(|event| Ok::<_, std::convert::Infallible>(event))
+                .ok(),
+            Err(_) => None, // Lagged: the UI re-syncs with a cursor poll.
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new().interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Public (no auth) routes for the Logs page. The page itself is a static asset
+/// and the chat traffic it displays is already visible in the router's own
+/// access log, so these endpoints stay unauthenticated like the /_ui assets.
+fn ui_logs_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/_ui/logs", get(ui_logs))
+        .route("/_ui/stats", get(ui_stats))
+        .route("/_ui/logs/stream", get(ui_logs_stream))
+}
+
+// ============================================================================
+// Config-page API for the llama.cpp webui: /_ui/config
+// Hot-mutable thinking effort (default + rewrite map) and per-model context
+// caps; model renames are proxied to the llm-watcher. Same no-auth posture as
+// the other /_ui routes (the deployments run on trusted LANs; the chat API
+// aliases right next door are unauthenticated the same way).
+// ============================================================================
+
+async fn ui_config_get() -> Response {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    Json(store.document().await).into_response()
+}
+
+async fn ui_config_effort(Json(body): Json<Value>) -> Response {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    match store.apply_effort(&body) {
+        Ok(_) => Json(store.document().await).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// One per-model context cap edit. ctx null (or absent) removes the cap.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CtxPatch {
+    pub model: String,
+    #[serde(default)]
+    pub ctx: Option<u64>,
+}
+
+async fn ui_config_ctx(Json(patch): Json<CtxPatch>) -> Response {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    match store.apply_ctx(&patch.model, patch.ctx) {
+        Ok(_) => Json(store.document().await).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// Rename request forwarded verbatim to the watcher control plane. The body is
+/// either {"map":"orig:new,..."} or an object; the watcher re-registers the
+/// owned workers on its next pass and persists the table in its ledger.
+async fn ui_config_model_map(Json(body): Json<Value>) -> Response {
+    let store = crate::runtime_config::RuntimeConfigStore::install();
+    let Some(url) = store.watcher_url() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "watcher not configured (set LMR_WATCHER_URL)"})),
+        )
+            .into_response();
+    };
+    match crate::runtime_config::proxy_model_map(&url, body).await {
+        Ok(mut value) => {
+            value["ok"] = json!(true);
+            Json(value).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+fn ui_config_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/_ui/config", get(ui_config_get).post(ui_config_effort))
+        .route("/_ui/config/effort", post(ui_config_effort))
+        .route("/_ui/config/ctx", post(ui_config_ctx))
+        .route("/_ui/config/model-map", post(ui_config_model_map))
 }
 
 async fn liveness() -> Response {
@@ -889,6 +1086,8 @@ pub fn build_app(
         .merge(protected_routes)
         .merge(public_routes)
         .merge(ui_api_routes(auth_config.clone()))
+        .merge(ui_logs_routes())
+        .merge(ui_config_routes())
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
@@ -901,6 +1100,7 @@ pub fn build_app(
             app_state.context.inflight_tracker.clone(),
         ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
+        .layer(middleware::RequestLogLayer)
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
         .with_state(app_state)
@@ -944,6 +1144,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
+    }
+
+    // In-memory request log for the /_ui/ Logs page: a ring buffer plus sliding
+    // token-rate windows, nothing ever hits disk. LMR_REQUEST_LOG_CAPACITY=0
+    // keeps the feature entirely off.
+    {
+        use crate::observability::request_log::RequestLogStore;
+        let capacity = std::env::var("LMR_REQUEST_LOG_CAPACITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(crate::observability::request_log::DEFAULT_CAPACITY);
+        if capacity > 0 {
+            RequestLogStore::install(RequestLogStore::new(capacity));
+            info!("request log enabled: in-memory ring of {} records (GET /_ui/logs)", capacity);
+        }
     }
 
     let (mesh_handler, mesh_sync_manager) = if let Some(mesh_server_config) =

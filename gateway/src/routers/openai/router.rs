@@ -478,6 +478,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let model = model_id.unwrap_or(body.model.as_str());
         let streaming = body.stream;
 
+        // Request-log ingest (/_ui/logs): the middleware created the row and only
+        // the router knows what the typed request actually carried.
+        {
+            use crate::observability::request_log::{head_fields_from_body, ingest_from_headers};
+            if let Some(ingest) = ingest_from_headers(headers) {
+                let (bm, effort, session) = match to_value(body) {
+                    Ok(v) => head_fields_from_body(&v),
+                    Err(_) => (None, None, None),
+                };
+                ingest.note_request(
+                    bm.as_deref().unwrap_or(model),
+                    effort.as_deref(),
+                    session,
+                    streaming,
+                );
+                ingest.set_route_type("openai-model-card");
+            }
+        }
+
         // Record request start
         Metrics::record_router_request(
             metrics_labels::ROUTER_OPENAI,
@@ -522,6 +541,36 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
+
+        // Runtime config (/_ui/config): thinking-effort policy and per-model
+        // context caps, hot-mutable without a restart. Env baselines:
+        // LMR_DEFAULT_EFFORT / LMR_EFFORT_MAP / LMR_MODEL_CTX.
+        // (the requested effort is already on the log row via note_request,
+        // which reads the body before the policy runs)
+        let (_requested_effort, effective_effort) =
+            crate::runtime_config::apply_effort_policy(&mut payload);
+        crate::runtime_config::apply_ctx_cap(&mut payload, model);
+
+        if let Some(ingest) = crate::observability::request_log::ingest_from_headers(headers) {
+            let effort = effective_effort
+                .as_deref()
+                .or_else(|| payload.get("reasoning_effort").and_then(|v| v.as_str()));
+            let provider_str = worker
+                .provider_for_model(model)
+                .or_else(|| worker.default_provider())
+                .map(|p| p.as_str())
+                .unwrap_or("openai");
+            ingest.set_decision(model, Some(provider_str), effort.as_deref());
+            ingest.set_selected_worker(worker.url());
+            ingest.set_candidates(
+                &self
+                    .worker_registry
+                    .get_by_model(model)
+                    .iter()
+                    .map(|w| crate::observability::request_log::compact_url(w.url()))
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
@@ -608,6 +657,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             Ok(body) => {
                                 if status.is_success() {
                                     worker.circuit_breaker().record_success();
+                                }
+                                if let Some(ingest) = crate::observability::request_log::
+                                    ingest_from_headers((*headers).as_ref())
+                                {
+                                    if status.is_success() {
+                                        ingest.observe_json_body(&body);
+                                    } else {
+                                        ingest.observe_text(&String::from_utf8_lossy(&body));
+                                    }
                                 }
                                 let mut response = Response::new(Body::from(body));
                                 *response.status_mut() = status;
@@ -908,6 +966,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
+
+        // Runtime config (/_ui/config): same thinking/ctx policy as chat.
+        crate::runtime_config::apply_effort_policy(&mut payload);
+        crate::runtime_config::apply_ctx_cap(&mut payload, model);
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {

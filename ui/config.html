@@ -1,0 +1,628 @@
+<!doctype html>
+<!--
+  llm-router「Config 网关配置」页面（自包含单文件：内联 CSS/JS，无外部 CDN、无构建工具、无 service worker）
+
+  用途：llm-router（Rust axum 网关）把官方 llama.cpp webui 静态挂在 /_ui/ 下，本文件与之同目录。
+        页面通过 ./config 读取运行时配置，通过 ./config/effort、./config/ctx、./config/model-map
+        三个 POST 接口写回；模型下拉复用既有 GET ./v1/models。页面在 /_ui/config.html，
+        因此 ./config 解析为 /_ui/config。http 明文可用。
+
+  四组能力（与后端契约一一对应）：
+    1) 默认思考强度 default_effort：请求未带 reasoning_effort 时由网关注入该值（null = 不注入）。
+    2) 思考强度映射 effort_map：命中 from 的请求把 reasoning_effort 改写为 to（例如 high→xhigh）。
+    3) 上下文上限 model_ctx：限制该模型单次请求 max_tokens 上限，并改写 /props 报告的 n_ctx。
+    4) 模型名映射 watcher.model_map：转发给 llm-watcher 落地（网关只代理，改名由 watcher 持久化）。
+
+  官方 webui 升级后如何恢复：本文件与 logs-inject.js 都不在 SvelteKit 构建产物里
+  （也不在 ui/sw.js 的 precache 列表），升级 ui/ 目录时只要不整目录删除就不会丢；
+  会被覆盖的只是 index.html 里的注入行：
+      cd <仓库> && bash watcher/patch_ui_logs.sh      # 幂等重打 index.html 注入
+  注入是单文件方案：logs-inject.js 一个脚本同时注入 Logs 与 Config 两个导航按钮。
+-->
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 内联空 favicon：避免浏览器自动请求 /favicon.ico 产生 404 噪声，掩盖真实报错 -->
+<link rel="icon" href="data:,">
+<title>Config · llm-router</title>
+<style>
+/* 配色与 llama-ui 同风格（近黑底），暗色层级与 logs.html 完全同一套变量 */
+:root{
+  color-scheme:dark;
+  --bg:#0d0d0f; --surface:#171719; --raised:#1f1f22; --raised-hover:#28282c;
+  --border:#2c2c31; --border-soft:#232326; --hover:#ffffff0a;
+  --text:#ececec; --muted:#a3a3ab; --faint:#7c7c85;
+  --green:#4ecb9d; --red:#f87171; --amber:#fbbf24; --gray:#8a8a92;
+  --radius:12px; --radius-sm:8px; --radius-pill:999px;
+  --font-code:ui-monospace,"SFMono-Regular","Cascadia Code","JetBrains Mono","Noto Sans Mono CJK SC",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{background:var(--bg);color:var(--text);margin:0}
+body{font-family:var(--font-code);font-size:13px;line-height:1.5;padding:0 16px 24px;
+  font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+a{color:var(--muted);text-decoration:none}
+a:hover{color:var(--text)}
+button{font:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer}
+code{font-family:var(--font-code);font-size:12px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:var(--radius-pill);border:2px solid var(--bg)}
+
+.wrap{max-width:860px;margin:0 auto}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 0 10px;flex-wrap:wrap}
+.topbar h1{font-size:16px;font-weight:600;margin:0}
+.back{font-size:13px;color:var(--muted);border:1px solid var(--border);border-radius:var(--radius-pill);
+  padding:4px 12px;background:var(--surface)}
+.back:hover{background:var(--raised);color:var(--text)}
+.conn{margin-left:auto;color:var(--gray);font-size:12px}
+.conn[hidden]{display:none}
+
+/* 顶部状态条：watcher 可达性（绿点在线 / 红点不可达+URL / 灰点未配置） */
+.statusbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 14px;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:8px 14px}
+.statusbar .lbl{color:var(--muted);font-size:12px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--gray);flex:none}
+.dot.ok{background:var(--green)} .dot.bad{background:var(--red)} .dot.off{background:var(--gray)}
+.statusbar .val{font-size:12px;color:var(--text)}
+.statusbar .val.bad{color:var(--red)}
+.statusbar .val.mut{color:var(--muted)}
+.statusbar .url{color:var(--faint);overflow-wrap:anywhere}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px 16px;margin-bottom:14px}
+.card h2{font-size:14px;font-weight:600;margin:0 0 2px}
+.desc{color:var(--muted);font-size:12px;margin:0 0 10px}
+.desc code{background:var(--raised);border:1px solid var(--border-soft);border-radius:4px;padding:0 4px}
+.hint{color:var(--faint);font-size:11px;margin-top:8px}
+.hint.warn{color:var(--amber)}
+
+.field{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}
+.field .lbl{color:var(--muted);font-size:12px;min-width:96px}
+.select,.input{background:var(--raised);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:6px 10px;font:inherit;color:var(--text);max-width:360px}
+.select:focus,.input:focus,textarea:focus{outline:none;border-color:var(--faint)}
+.input::placeholder{color:var(--faint)}
+select option{background:var(--surface);color:var(--text)}
+.input.num{width:110px;max-width:110px;text-align:right}
+.input.model{flex:1 1 220px;min-width:180px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border:1px solid var(--border);
+  border-radius:var(--radius-pill);background:var(--surface);font-size:12px;color:var(--text)}
+.btn:hover{background:var(--raised)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.ghost{border-style:dashed;color:var(--muted)}
+.btn.mini{padding:3px 9px;font-size:11px}
+.btn.danger{color:var(--red)}
+.arrow{color:var(--faint)}
+.muted{color:var(--muted)} .faint{color:var(--faint)}
+.dash{color:var(--faint)}
+
+.rows{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+.rows[hidden]{display:none}
+.erow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+textarea{width:100%;background:var(--raised);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:8px 10px;font:inherit;color:var(--text);resize:vertical;min-height:76px}
+textarea::placeholder{color:var(--faint)}
+
+/* 只读映射列表（watcher.model_map / env_defaults） */
+.list{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);
+  padding:8px 12px;margin-top:8px;overflow-wrap:anywhere}
+.list[hidden]{display:none}
+.list .li{display:flex;gap:8px;align-items:baseline;padding:2px 0;font-size:12px}
+.list .li+.li{border-top:1px solid var(--border-soft)}
+
+details.env{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:12px 16px;margin-bottom:14px}
+details.env summary{font-size:13px;font-weight:600;cursor:pointer;list-style:none}
+details.env summary::-webkit-details-marker{display:none}
+details.env summary::before{content:"▸ ";color:var(--faint)}
+details.env[open] summary::before{content:"▾ "}
+details.env .body{margin-top:10px}
+
+.toast-box{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9;
+  display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;max-width:92vw}
+.toast{pointer-events:auto;display:flex;align-items:center;gap:10px;background:var(--raised);
+  border:1px solid var(--border);border-radius:var(--radius-pill);padding:7px 16px;font-size:12px;
+  color:var(--text);box-shadow:0 4px 16px #0009;animation:fadein .15s ease-out;max-width:100%}
+.toast.ok{border-color:#4ecb9d55} .toast.err{border-color:#f8717155}
+.toast .tag{font-weight:700;flex:none}
+.toast.ok .tag{color:var(--green)} .toast.err .tag{color:var(--red)}
+.toast .msg{overflow-wrap:anywhere;white-space:pre-wrap;text-align:left}
+.toast.out{opacity:0;transition:opacity .3s}
+@keyframes fadein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+@media (max-width:640px){
+  .field .lbl{min-width:100%}
+  .erow .select,.erow .input{max-width:none;flex:1 1 120px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <a class="back" href="./">&larr; 返回聊天</a>
+    <a class="back" href="./logs.html">Logs</a>
+    <h1>Config 网关配置</h1>
+    <span class="conn" id="conn" hidden>配置接口不可达，重试中</span>
+  </div>
+
+  <!-- A. 状态条：watcher 可达性 -->
+  <div class="statusbar" id="statusbar">
+    <span class="lbl">llm-watcher</span>
+    <span class="dot off" id="w-dot"></span>
+    <span class="val mut" id="w-val">加载中…</span>
+    <span class="url" id="w-url"></span>
+  </div>
+
+  <!-- B. 思考强度 -->
+  <section class="card">
+    <h2>思考强度</h2>
+    <p class="desc">作用于网关对 <code>reasoning_effort</code> 的注入与改写；改动立即生效，重启后回到环境默认。</p>
+
+    <div class="field">
+      <span class="lbl">默认思考强度</span>
+      <select class="select" id="eff-default"></select>
+      <button class="btn" id="eff-default-save" type="button">保存</button>
+    </div>
+    <div class="hint">请求未带 reasoning_effort 时注入该值；「跟随后端默认 (null)」表示网关不注入。</div>
+
+    <div class="field" style="margin-top:14px">
+      <span class="lbl">思考强度映射</span>
+      <button class="btn mini ghost" id="eff-map-add" type="button">添加一行</button>
+      <button class="btn" id="eff-map-save" type="button">保存映射</button>
+    </div>
+    <div class="rows" id="eff-map-rows"></div>
+    <div class="hint">命中映射的请求会把 reasoning_effort 改写为新值，例如 high&rarr;xhigh。to 留空的行提交时忽略；
+      删除一行后直接「保存映射」即可移除该映射（保存提交的是完整列表）。</div>
+  </section>
+
+  <!-- C. 上下文上限 -->
+  <section class="card">
+    <h2>上下文上限</h2>
+    <p class="desc">限制该模型单次请求的 max_tokens 上限，并把 /props 的 n_ctx 报告值改写为该值。</p>
+    <div class="rows" id="ctx-list"></div>
+    <div class="field">
+      <input class="input model" id="ctx-model" list="model-ids" autocomplete="off" spellcheck="false"
+        placeholder="模型名（可从下拉选择或直接输入）">
+      <datalist id="model-ids"></datalist>
+      <input class="input num" id="ctx-nums" type="number" min="1" step="1" placeholder="如 32768">
+      <button class="btn" id="ctx-save" type="button">保存</button>
+    </div>
+    <div class="hint" id="ctx-empty" hidden>当前没有任何模型的上下文覆盖。</div>
+  </section>
+
+  <!-- D. 模型名映射 -->
+  <section class="card">
+    <h2>模型名映射</h2>
+    <p class="desc">把上游原始模型名改写为对外名称。<code>原始名:新名</code>，每行一条，也接受逗号分隔。</p>
+    <textarea id="mm-text" spellcheck="false" placeholder="qwen3-32b:qwen3-32b-prod&#10;Ornith-35B:ornith"></textarea>
+    <div class="field">
+      <button class="btn" id="mm-apply" type="button">应用</button>
+      <span class="muted" id="mm-note"></span>
+    </div>
+    <div class="hint" id="mm-hint"></div>
+    <div class="muted" style="margin-top:10px">当前生效映射</div>
+    <div class="list" id="mm-list"></div>
+  </section>
+
+  <!-- E. 环境默认值（只读） -->
+  <details class="env" id="env-details">
+    <summary>环境默认值（只读）</summary>
+    <div class="body">
+      <p class="desc" style="margin:0 0 8px">运行时改动重启后回到环境默认；改名由 watcher ledger 持久化。</p>
+      <div class="kv" id="env-body"></div>
+    </div>
+  </details>
+</div>
+
+<div class="toast-box" id="toast-box"></div>
+
+<script>
+"use strict";
+/* ===================== 数据层 =====================
+   单一状态源：GET ./config 的响应体。所有写操作（三个 POST）成功后都用响应体
+   整体替换 state 并重新渲染，因此前端从不本地乐观修改状态；
+   仅「思考强度映射」的编辑行是前端临时态（renderEffortMap 里合并 state + 草稿行）。
+   模型下拉来自既有 GET ./v1/models（OpenAI 标准结构），加载失败退化为纯手动输入。 */
+
+/* 与后端契约一致的档位集合：下拉 9 项 = 空(跟随后端) + 以下 8 档；
+   from 列多一个空选项（表示「不限/清除」占位行）。 */
+var EFForts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+
+var state = null;                 // 最近一次 GET/POST ./config* 返回的完整结构
+var modelIds = [];                // ./v1/models 的 id 列表
+var mapDraft = null;              // 映射编辑草稿（数组 [{from,to}]），null = 未被用户改动过
+var loading = false;              // 全局防重复提交（任一写请求在途时禁用全部按钮）
+var connBox = document.getElementById('conn');
+
+var ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function esc(s){ return String(s).replace(/[&<>"']/g, function(ch){ return ESC[ch]; }); }
+
+/* ---------- 请求封装：错误信息优先展示后端 error 字段原文 ---------- */
+function errFrom(status, body){
+  if (body && typeof body === 'object') {
+    if (typeof body.error === 'string') return body.error;
+    if (body.error && typeof body.error.message === 'string') return body.error.message;
+    if (typeof body.message === 'string') return body.message;
+  }
+  return 'HTTP ' + status;
+}
+function fetchJson(url){
+  return fetch(url, { cache: 'no-store' }).then(function(r){
+    return r.json().catch(function(){ return null; }).then(function(b){
+      if (!r.ok) throw new Error(errFrom(r.status, b));
+      return b;
+    });
+  }, function(){ throw new Error('网络错误：无法连接网关'); });
+}
+function postJson(url, body){
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function(r){
+    return r.json().catch(function(){ return null; }).then(function(b){
+      if (!r.ok) throw new Error(errFrom(r.status, b));
+      return b;
+    });
+  }, function(){ throw new Error('网络错误：无法连接网关'); });
+}
+
+/* ---------- toast：成功/失败短提示（样式基调沿用 logs.html 的浮层） ---------- */
+function toast(kind, msg){
+  var box = document.getElementById('toast-box');
+  var el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  var tag = document.createElement('span');
+  tag.className = 'tag';
+  tag.textContent = kind === 'err' ? '失败' : '成功';
+  var m = document.createElement('span');
+  m.className = 'msg';
+  m.textContent = msg;                                   // textContent：后端 error 原文不解析 HTML
+  el.appendChild(tag); el.appendChild(m);
+  box.appendChild(el);
+  setTimeout(function(){
+    el.classList.add('out');
+    setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 350);
+  }, kind === 'err' ? 6000 : 2600);
+}
+
+/* ---------- 提交锁：在途时禁用全部写按钮，防重复提交 ---------- */
+function allButtons(){
+  return Array.prototype.slice.call(document.querySelectorAll('.card .btn, #mm-apply'));
+}
+function setBusy(on){
+  loading = on;
+  allButtons().forEach(function(b){ b.disabled = on; });
+  if (!on) render();                                     // 解锁后按当前状态重算禁用项（如 watcher 不可达）
+}
+
+/* ===================== 渲染 =====================
+   render() 以 state 为唯一事实整页重绘；模型下拉的 options 独立重建一次。 */
+function effortOptions(withEmpty, selected){
+  /* withEmpty=true 时补一个空值首项：selected==='' 显示「跟随后端默认 (null)」（默认档位下拉），
+     其余场合（映射行）显示「—」占位，语义是「未选择/不限」 */
+  var frag = document.createDocumentFragment();
+  if (withEmpty) {
+    var o0 = document.createElement('option');
+    o0.value = '';
+    o0.textContent = selected === '' ? '跟随后端默认 (null)' : '—';
+    frag.appendChild(o0);
+  }
+  for (var i = 0; i < EFForts.length; i++) {
+    var o = document.createElement('option');
+    o.value = EFForts[i];
+    o.textContent = EFForts[i];
+    frag.appendChild(o);
+  }
+  return frag;
+}
+/* 把 select 的当前值对齐到 v；v 不在集合内时临时补一个高亮项（原样显示脏值，保存会覆盖） */
+function syncSelect(sel, v){
+  var want = (v === null || v === undefined) ? '' : String(v);
+  var known = want === '' || EFForts.indexOf(want) !== -1;
+  if (!known) {
+    var o = document.createElement('option');
+    o.value = want; o.textContent = want + '（未知档位）';
+    sel.appendChild(o);
+  }
+  sel.value = known ? want : want;
+}
+
+/* ---------- A. 状态条 ---------- */
+function renderWatcher(){
+  var dot = document.getElementById('w-dot');
+  var val = document.getElementById('w-val');
+  var url = document.getElementById('w-url');
+  dot.className = 'dot'; val.className = 'val'; val.textContent = ''; url.textContent = '';
+  var w = state && state.watcher ? state.watcher : {};
+  if (!w.url) {
+    dot.classList.add('off'); val.classList.add('mut');
+    val.textContent = '未配置（网关未设置 LMR_WATCHER_URL）';
+  } else if (w.reachable) {
+    dot.classList.add('ok'); val.textContent = '在线';
+    url.textContent = w.url;
+  } else {
+    dot.classList.add('bad'); val.classList.add('bad'); val.textContent = '不可达';
+    url.textContent = w.url;
+  }
+}
+
+/* ---------- B1. 默认思考强度 ---------- */
+function renderDefaultEffort(){
+  var sel = document.getElementById('eff-default');
+  sel.innerHTML = '';
+  sel.appendChild(effortOptions(true, ''));
+  var v = state ? state.default_effort : null;
+  syncSelect(sel, v);
+  // 首项 label 固定为「跟随后端默认 (null)」
+  if (sel.firstElementChild) sel.firstElementChild.textContent = '跟随后端默认 (null)';
+}
+
+/* ---------- B2. 思考强度映射 ---------- */
+function mapRows(){
+  /* 编辑态行集合：用户改动过用草稿，否则用 state 的行 + 空态占位一行 */
+  if (mapDraft) return mapDraft;
+  var src = state && Array.isArray(state.effort_map) ? state.effort_map : [];
+  var rows = src.map(function(r){ return { from: r.from || '', to: r.to || '' }; });
+  if (!rows.length) rows.push({ from: '', to: '' });
+  return rows;
+}
+function renderEffortMap(){
+  var host = document.getElementById('eff-map-rows');
+  host.innerHTML = '';
+  var rows = mapRows();
+  rows.forEach(function(row, idx){
+    var line = document.createElement('div');
+    line.className = 'erow';
+    var from = document.createElement('select');
+    from.className = 'select';
+    from.appendChild(effortOptions(true, null));
+    syncSelect(from, row.from);
+    from.addEventListener('change', function(){ draft()[idx].from = from.value; });
+    var arrow = document.createElement('span');
+    arrow.className = 'arrow'; arrow.textContent = '→';
+    var to = document.createElement('select');
+    to.className = 'select';
+    to.appendChild(effortOptions(true, null));
+    syncSelect(to, row.to);
+    to.addEventListener('change', function(){ draft()[idx].to = to.value; });
+    var del = document.createElement('button');
+    del.type = 'button'; del.className = 'btn mini danger'; del.textContent = '删除';
+    del.addEventListener('click', function(){
+      var d = draft();
+      d.splice(idx, 1);
+      if (!d.length) d.push({ from: '', to: '' });
+      renderEffortMap();
+    });
+    line.appendChild(from); line.appendChild(arrow); line.appendChild(to); line.appendChild(del);
+    host.appendChild(line);
+  });
+}
+/* 草稿物化：第一次被用户改动时把 state 行复制成草稿 */
+function draft(){
+  if (!mapDraft) mapDraft = mapRows().map(function(r){ return { from: r.from, to: r.to }; });
+  return mapDraft;
+}
+
+/* ---------- C. 上下文上限 ---------- */
+function fmtCtx(n){ return (typeof n === 'number' && isFinite(n)) ? n.toLocaleString('en-US') : String(n); }
+function renderCtx(){
+  var host = document.getElementById('ctx-list');
+  host.innerHTML = '';
+  var list = state && Array.isArray(state.model_ctx) ? state.model_ctx : [];
+  document.getElementById('ctx-empty').hidden = list.length > 0;
+  list.forEach(function(item){
+    var line = document.createElement('div');
+    line.className = 'erow';
+    var model = document.createElement('span');
+    model.className = 'input model';                    // 借用 .input 外观做只读展示
+    model.style.maxWidth = 'none';
+    model.textContent = item.model;                     // textContent：模型名防 XSS
+    var ctx = document.createElement('span');
+    ctx.className = 'input num';
+    ctx.style.textAlign = 'right';
+    ctx.textContent = fmtCtx(item.ctx);
+    var clr = document.createElement('button');
+    clr.type = 'button'; clr.className = 'btn mini danger'; clr.textContent = '清除';
+    clr.addEventListener('click', function(){
+      submit('./config/ctx', { model: item.model, ctx: null }, '已清除 ' + item.model);
+    });
+    line.appendChild(model); line.appendChild(ctx); line.appendChild(clr);
+    host.appendChild(line);
+  });
+}
+
+/* ---------- D. 模型名映射 ---------- */
+function renderModelMap(){
+  var w = state && state.watcher ? state.watcher : {};
+  var btn = document.getElementById('mm-apply');
+  var hint = document.getElementById('mm-hint');
+  var ta = document.getElementById('mm-text');
+  var usable = !!(w.url && w.reachable);
+  btn.disabled = !usable || loading;
+  ta.disabled = !usable;
+  hint.className = 'hint';
+  if (!w.url) {
+    hint.classList.add('warn');
+    hint.textContent = '未配置 watcher：请为网关设置环境变量 LMR_WATCHER_URL 后重启，才能应用改名。';
+  } else if (!w.reachable) {
+    hint.className = 'hint warn';
+    hint.textContent = '模型改名由 llm-watcher 落地，watcher 不可达（' + w.url + '），暂时无法应用。';
+  } else {
+    hint.textContent = '应用后由 llm-watcher 落地并持久化（watcher ledger）。';
+  }
+  var list = document.getElementById('mm-list');
+  list.innerHTML = '';
+  var map = w.model_map;
+  var keys = map && typeof map === 'object' ? Object.keys(map) : [];
+  if (!keys.length) {
+    var li = document.createElement('div');
+    li.className = 'li';
+    li.innerHTML = '<span class="dash">-</span>';
+    list.appendChild(li);
+  }
+  keys.forEach(function(k){
+    var li = document.createElement('div');
+    li.className = 'li';
+    var a = document.createElement('span'); a.textContent = k;
+    var arrow = document.createElement('span'); arrow.className = 'arrow'; arrow.textContent = '→';
+    var b = document.createElement('span'); b.textContent = String(map[k]);
+    li.appendChild(a); li.appendChild(arrow); li.appendChild(b);
+    list.appendChild(li);
+  });
+}
+
+/* ---------- E. 环境默认值（只读） ---------- */
+function kvLine(host, k, v){
+  var row = document.createElement('div');
+  row.className = 'li';
+  var kk = document.createElement('span'); kk.className = 'muted'; kk.textContent = k;
+  var vv = document.createElement('span'); vv.textContent = v;
+  row.appendChild(kk); row.appendChild(vv);
+  host.appendChild(row);
+}
+function renderEnv(){
+  var host = document.getElementById('env-body');
+  host.className = 'list';
+  host.innerHTML = '';
+  var e = state && state.env_defaults ? state.env_defaults : {};
+  kvLine(host, 'default_effort', e.default_effort === null || e.default_effort === undefined ? 'null（不注入）' : String(e.default_effort));
+  var em = Array.isArray(e.effort_map) ? e.effort_map : [];
+  kvLine(host, 'effort_map', em.length
+    ? em.map(function(r){ return (r.from || '?') + ' → ' + (r.to || '?'); }).join('，')
+    : '（空）');
+  var mc = Array.isArray(e.model_ctx) ? e.model_ctx : [];
+  kvLine(host, 'model_ctx', mc.length
+    ? mc.map(function(r){ return r.model + ' = ' + fmtCtx(r.ctx); }).join('，')
+    : '（空）');
+}
+
+function renderDatalist(){
+  var dl = document.getElementById('model-ids');
+  dl.innerHTML = '';
+  modelIds.forEach(function(id){
+    var o = document.createElement('option');
+    o.value = id;                                        // option.value 不进 HTML 解析，安全
+    dl.appendChild(o);
+  });
+}
+function render(){
+  renderWatcher();
+  renderDefaultEffort();
+  renderEffortMap();
+  renderCtx();
+  renderModelMap();
+  renderEnv();
+  renderDatalist();
+}
+
+/* ===================== 写操作 =====================
+   统一走 submit()：加锁 → POST → 成功则用响应体整体刷新（模型名映射除外，
+   它只回 ok/model_map/note，故局部更新 state.watcher.model_map 并重拉一次整页）。 */
+function submit(url, body, okMsg){
+  if (loading) return Promise.resolve(null);
+  setBusy(true);
+  return postJson(url, body).then(function(res){
+    setBusy(false);
+    connBox.hidden = true;
+    if (url === './config/model-map') {
+      if (!state) state = {};
+      if (!state.watcher) state.watcher = { url: null, reachable: false, model_map: null };
+      state.watcher.model_map = res && res.model_map ? res.model_map : null;
+      render();
+      toast('ok', okMsg + (res && res.note ? ' · ' + res.note : ''));
+      if (res && res.warning) toast('err', '注意（部分项被忽略）：' + res.warning);
+      refresh();                                          // 改名会连带影响模型列表，整页重拉一次
+    } else {
+      state = res;                                        // 其余接口返回最新完整 GET 结构
+      mapDraft = null;                                    // 映射以服务端为准重建
+      render();
+      toast('ok', okMsg);
+    }
+    return res;
+  }, function(err){
+    setBusy(false);
+    toast('err', err && err.message ? err.message : String(err));   // 后端 error 字段原样展示
+    return null;
+  });
+}
+
+/* ---------- B1 保存默认档位 ---------- */
+document.getElementById('eff-default-save').addEventListener('click', function(){
+  var v = document.getElementById('eff-default').value;
+  var cur = state ? state.default_effort : null;
+  var next = v === '' ? null : v;                         // 空串按 null 处理（契约）
+  if (next === cur) { toast('ok', '默认思考强度未变化'); return; }
+  submit('./config/effort', { default_effort: next },
+    next === null ? '默认思考强度已设为跟随后端默认' : '默认思考强度已设为 ' + next);
+});
+
+/* ---------- B2 映射：增行 / 保存 ---------- */
+document.getElementById('eff-map-add').addEventListener('click', function(){
+  draft().push({ from: '', to: '' });
+  renderEffortMap();
+});
+document.getElementById('eff-map-save').addEventListener('click', function(){
+  /* 提交组装：from 与 to 都选齐的行才生效；to 空串由后端按「删除该映射」处理，
+     前端直接把这种行排除即可等价表达删除；全部有效行组成完整列表（空数组 = 清空）。 */
+  var eff = mapRows()
+    .filter(function(r){ return r.from && r.to; })
+    .map(function(r){ return { from: r.from, to: r.to }; });
+  var cur = (state && Array.isArray(state.effort_map)) ? state.effort_map : [];
+  var same = eff.length === cur.length && eff.every(function(r, i){
+    return cur[i] && cur[i].from === r.from && cur[i].to === r.to;
+  });
+  if (same) { toast('ok', '思考强度映射未变化'); return; }
+  submit('./config/effort', { effort_map: eff },
+    eff.length ? '已保存 ' + eff.length + ' 条思考强度映射' : '已清空全部思考强度映射');
+});
+
+/* ---------- C 保存上下文上限 ---------- */
+document.getElementById('ctx-save').addEventListener('click', function(){
+  var model = document.getElementById('ctx-model').value.trim();
+  var raw = document.getElementById('ctx-nums').value.trim();
+  var n = Number(raw);
+  if (!model) { toast('err', '请填写模型名'); return; }
+  if (!raw || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    toast('err', '上下文必须是正整数（例如 32768）');
+    return;
+  }
+  submit('./config/ctx', { model: model, ctx: n }, '已设置 ' + model + ' 上限 ' + fmtCtx(n));
+});
+
+/* ---------- D 应用模型名映射 ---------- */
+document.getElementById('mm-apply').addEventListener('click', function(){
+  var raw = document.getElementById('mm-text').value.trim();
+  if (!raw) { toast('err', '请先填写映射（原始名:新名，每行一条）'); return; }
+  /* 换行与逗号统一拆成条目；条目格式（含英文冒号、不含空键值）由后端校验并把 error 原样回传 */
+  var items = raw.split(/[\n,]+/).map(function(s){ return s.trim(); }).filter(Boolean);
+  if (!items.length) { toast('err', '未解析出任何映射条目'); return; }
+  submit('./config/model-map', { map: items.join(',') }, '模型名映射已提交（共 ' + items.length + ' 条）');
+});
+
+/* ===================== 初始化 ===================== */
+function refresh(){
+  return fetchJson('./config').then(function(cfg){
+    state = cfg;
+    mapDraft = null;
+    connBox.hidden = true;
+    render();
+  }, function(err){
+    connBox.hidden = false;
+    toast('err', '读取配置失败：' + (err && err.message ? err.message : String(err)));
+  });
+}
+function loadModels(){
+  return fetchJson('./v1/models').then(function(r){
+    var data = r && Array.isArray(r.data) ? r.data : [];
+    modelIds = data.map(function(m){ return m && typeof m.id === 'string' ? m.id : null; }).filter(Boolean);
+    renderDatalist();
+  }, function(){ /* 模型列表拿不到就退化为手动输入，不打扰 */ });
+}
+
+render();                                                 // 先渲染空态，避免白屏
+refresh();
+loadModels();
+</script>
+</body>
+</html>

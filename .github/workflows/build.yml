@@ -28,6 +28,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: gateway
+      # Guard: an upstream llama.cpp UI refresh silently drops the Logs entry
+      # <script> tag from the generated index.html. Fail before the 8-minute build.
+      - name: "Check ui/index.html Logs injection"
+        run: bash watcher/patch_ui_logs.sh --check
       - name: "Build smg (ci profile: thin LTO, fast)"
         run: cargo build --profile ci --bin smg
         working-directory: gateway

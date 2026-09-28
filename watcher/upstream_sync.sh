@@ -127,6 +127,12 @@ rsync -a --delete --exclude=.upstream-ref "$STAGE/" "$GATEWAY/"
 
 # --- local patch: llama.cpp webui mount (--ui-dir, /_ui routes) -----------
 python3 "$ROOT/watcher/patches/ui/apply_ui.py" "$GATEWAY" "$ROOT/watcher/patches/ui"
+
+# --- local patch: in-memory request log + /_ui/logs API (Logs page) -------
+python3 "$ROOT/watcher/patches/request-log/apply_request_log.py" "$GATEWAY" "$ROOT/watcher/patches/request-log"
+
+# --- local patch: runtime config (/_ui/config, hot-mutable effort/ctx) -----
+python3 "$ROOT/watcher/patches/runtime-config/apply_runtime_config.py" "$GATEWAY" "$ROOT/watcher/patches/runtime-config"
 echo "$TARGET_REF" > "$REF_FILE"
 log "gateway/ updated to upstream $TARGET_REF"
 
