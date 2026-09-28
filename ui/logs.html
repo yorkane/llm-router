@@ -110,7 +110,7 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
 .cand .ok{color:var(--green)}
 .note{color:var(--faint);font-size:11px;margin-top:8px}
 
-.paused{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);display:none;
+.paused{position:absolute;left:50%;top:46px;transform:translateX(-50%);display:none;
   align-items:center;gap:8px;background:var(--raised);border:1px solid var(--border);
   border-radius:var(--radius-pill);padding:5px 14px;font-size:12px;color:var(--muted);
   box-shadow:0 4px 16px #0009;white-space:nowrap}
@@ -176,7 +176,7 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
     </table>
     <div class="paused" id="paused" hidden>
       <span>已暂停滚动</span><span>·</span><span id="paused-new">有新日志</span><span>·</span>
-      <button class="detail-btn" id="tobottom" type="button">回到底部</button>
+      <button class="detail-btn" id="tobottom" type="button">回到最新</button>
     </div>
   </div>
 
@@ -194,7 +194,9 @@ tr.detail>td{background:var(--raised);padding:0 12px 12px;border-bottom:1px soli
      1) GET ./logs?cursor=<seq>  1s 轮询增量（权威、断线后可恢复）
      2) GET ./logs/stream        SSE 低延迟追加
    按 record.seq 去重（seen 表），因此两路重复投递同一请求只会渲染一次，
-   流式路径永远只 append <tr>（不整表重建）；只有筛选/清空/服务重启才 rebuild。
+   流式路径永远只 prepend <tr>（不整表重建）；只有筛选/清空/服务重启才 rebuild。
+   渲染顺序是「最新在最上面」：rows 数组仍按 seq 升序，DOM 与滚动取反向，
+   新请求出现在表格顶部、无需滚动即可看到。
    stats.started_at_ms 变化 = 网关进程重启 → 环形缓冲作废 → 前端整体重置。 */
 var MAX_ROWS = 2000;                 // 前端最多留 2000 行，超出丢最旧
 var POLL_MS = 1000;
@@ -389,17 +391,18 @@ function syncDetail(tr, r){ if (expanded[r.seq]) tr.insertAdjacentElement('after
 /* ---------- 前端缓冲与增量追加 ---------- */
 function ingest(records){
   if (!records || !records.length) return;
-  var list = records.slice().sort(function(a, b){ return a.seq - b.seq; });
+  var list = records.slice().sort(function(a, b){ return a.seq - b.seq; });   // 旧→新逐个插顶
   var added = 0;
   for (var i = 0; i < list.length; i++) {
     var r = list[i];
     if (!r || typeof r.seq !== 'number' || seen[r.seq]) continue;   // seq 去重（轮询与 SSE 共用）
     seen[r.seq] = true;
-    rows.push(r);
+    rows.push(r);                                                    // rows 保持 seq 升序
     if (r.seq > cursor) cursor = r.seq;
     if (matchesFilter(r)) {
       var tr = makeRow(r);
-      tbody.appendChild(tr);
+      // 升序逐行插到顶部：后到的新请求总是压在旧行上面 → DOM 顶部永远是最新
+      tbody.insertBefore(tr, tbody.firstChild);
       syncDetail(tr, r);
       added++;
     }
@@ -407,21 +410,23 @@ function ingest(records){
   if (!added) return;
   trimFront();
   updateEmpty();
-  if (autoscroll) scrollToBottom();
+  if (autoscroll) scrollToTop();
   else { pendingNew += added; pausedNew.textContent = '有新日志'; setPaused(true); }
 }
-/* 软上限：丢弃最旧的行，DOM 与数组同步（按 data-seq 精确判定，展开的详情行也一并移除） */
+/* 软上限：丢弃最旧的行。rows 升序所以最旧在数组头部；DOM 是倒序（最新在上），
+   最旧的行因此落在 DOM 尾部——从 lastChild 往前删，碰到仍需保留的行即停
+   （展开的详情行 key 不在 keep 表内，会随所属行一并清掉） */
 function trimFront(){
   var over = rows.length - MAX_ROWS;
   if (over <= 0) return;
   var keep = {};
   for (var i = over; i < rows.length; i++) keep[rows[i].seq] = true;
   rows = rows.slice(over);
-  while (tbody.firstChild) {
-    var first = tbody.firstChild;
-    var key = first.dataset.seq || first.dataset.detailFor;
+  while (tbody.lastChild) {
+    var last = tbody.lastChild;
+    var key = last.dataset.seq || last.dataset.detailFor;
     if (key && keep[key]) break;
-    tbody.removeChild(first);
+    tbody.removeChild(last);
   }
 }
 
@@ -437,7 +442,7 @@ function matchesFilter(r){
 }
 function rebuild(){
   tbody.innerHTML = '';
-  for (var i = 0; i < rows.length; i++) {
+  for (var i = rows.length - 1; i >= 0; i--) {   // 倒序渲染：最新在上
     var r = rows[i];
     if (!matchesFilter(r)) continue;
     var tr = makeRow(r);
@@ -445,7 +450,7 @@ function rebuild(){
     syncDetail(tr, r);
   }
   updateEmpty();
-  if (autoscroll) scrollToBottom();
+  if (autoscroll) scrollToTop();
 }
 function updateEmpty(){
   var showEmpty = loadedOnce && tbody.querySelector('tr.row') === null;
@@ -454,9 +459,9 @@ function updateEmpty(){
     "curl '" + new URL('./logs?cursor=0&limit=1000', location.href).href + "'";
 }
 
-/* ---------- 滚动控制：用户手动上滚即暂停自动滚动 ---------- */
-function atBottom(){ return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 48; }
-function scrollToBottom(){ wrap.scrollTop = wrap.scrollHeight; pendingNew = 0; setPaused(false); }
+/* ---------- 滚动控制：锚点在顶部（最新行），往下翻历史即暂停 ---------- */
+function atTop(){ return wrap.scrollTop < 48; }
+function scrollToTop(){ wrap.scrollTop = 0; pendingNew = 0; setPaused(false); }
 function setPaused(on){
   pausedBox.hidden = !on;
   pausedBox.classList.toggle('on', on);
@@ -464,15 +469,15 @@ function setPaused(on){
 }
 wrap.addEventListener('scroll', function(){
   if (!autoscroll) return;
-  if (atBottom()) setPaused(false);
-  else { autoscroll = false; autoscrollBox.checked = false; setPaused(true); }  // 用户上滚 → 暂停
+  if (atTop()) setPaused(false);
+  else { autoscroll = false; autoscrollBox.checked = false; setPaused(true); }  // 下滚翻历史 → 暂停
 });
 autoscrollBox.addEventListener('change', function(){
   autoscroll = autoscrollBox.checked;
-  if (autoscroll) scrollToBottom(); else setPaused(true);
+  if (autoscroll) scrollToTop(); else setPaused(true);
 });
 document.getElementById('tobottom').addEventListener('click', function(){
-  autoscroll = true; autoscrollBox.checked = true; scrollToBottom();
+  autoscroll = true; autoscrollBox.checked = true; scrollToTop();
 });
 
 /* ---------- 行内交互（事件委托，避免逐行绑监听器） ---------- */
