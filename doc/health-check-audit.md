@@ -103,7 +103,7 @@ watcher 暴露 10 个指标（llm_watcher.py:1189-1198）：`reconciles_total`�
 | 2 | 模型加载期 503 与进程死亡都判 dead，按 3 次阈值约 3 分钟误摘（21.k 8022 真实发生过） | `activity_probe` 新增独立 `"error"` verdict；`_note_activity` 里 `"slow"` 与 `"error"` 共用 lenient 预算 = `activity_fail_threshold × activity_slow_factor`（默认 3×3=9 次），仅 refused（`"dead"`）走 3 次 | 已修复并上线。提交 `acc4fe1`；用例与部署同建议 1 |
 | 3 | strike 纯内存，watcher 每重启一次僵尸的 strike 清零一次 | `Ledger` 新增 `strikes: Dict[str,int]` 并持久化进 ledger.json；alive / 剔除 / 离开池时清除；`_check_activity` 在内存态缺失时从 ledger 恢复计数；新增 metric `llm_watcher_activity_strikes` | 已修复并上线。提交 `acc4fe1`；用例与部署同建议 1 |
 
-**第 4 个问题（报告外新发现）**：修完上述 3 个之后才暴露——`POST /model-map` 旧代码只认 `{"map": {...}}` dict 形态，POST `{"map": "orig:new"}` 字符串时缺少 string 分支，字面量 key `map` 被当成原模型名存进映射，改名静默失败并污染 ledger（217.t 实际踩到）。修复：抽出 `parse_model_map_body(raw)`，支持 plain object / `{"map": {...}}` / 裸 `a:b,c:d` / `{"map": "a:b,c:d"}` 四种形态，并带错误返回。回归 86→94（新增 `TestModelMapApi` 8 例）。追记时该修复位于工作区、尚未进 main，届时随提交落号。
+**第 4 个问题（报告外新发现）**：修完上述 3 个之后才暴露——`POST /model-map` 旧代码只认 `{"map": {...}}` dict 形态，POST `{"map": "orig:new"}` 字符串时缺少 string 分支，字面量 key `map` 被当成原模型名存进映射，改名静默失败并污染 ledger（217.t 实际踩到）。修复：抽出 `parse_model_map_body(raw)`，支持 plain object / `{"map": {...}}` / 裸 `a:b,c:d` / `{"map": "a:b,c:d"}` 四种形态，并带错误返回。回归 86→94（新增 `TestModelMapApi` 8 例）。对应提交 `10d8c7a`（main）。
 
 **本节的时点**：上表反映的是提交 `acc4fe1`（2026-09-28，main）之后的状态。第 2、4 节里被描述为「风险」的两处行为——加载期 5xx 按 dead 计罚导致约 3 分钟误摘、model-map 改名后的 404 永久漏杀——均已不再成立，通读前文时请以本节为准。
 
