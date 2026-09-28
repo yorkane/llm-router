@@ -143,6 +143,27 @@ fn ui_router_mode() -> bool {
         .unwrap_or(true)
 }
 
+/// llama-ui drops image attachments silently (it filters out every image_url
+/// part before sending) unless the model /props advertises modalities.vision.
+/// vLLM and SGLang workers have no /props at all, so the fallback document
+/// used to omit the field entirely and the router UI looked text-only even for
+/// vision models (ninfer and llama.cpp do answer /props with modalities, which
+/// is why 217.t worked). Engines still decide image support themselves, so
+/// advertise vision whenever the worker did not report modalities; a text-only
+/// model then fails loudly at the engine instead of the UI quietly swallowing
+/// the attachment.
+fn ui_props_with_modalities(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("modalities") {
+            obj.insert(
+                "modalities".to_string(),
+                json!({"audio": false, "video": false, "vision": true}),
+            );
+        }
+    }
+    value
+}
+
 fn ui_props_with_role(mut value: Value) -> Value {
     if ui_router_mode() {
         if let Some(obj) = value.as_object_mut() {
@@ -208,7 +229,7 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
                 if let Ok(body) = resp.text().await {
                     if let Ok(value) = serde_json::from_str::<Value>(&body) {
                         return Json(ui_props_with_ctx(
-                            ui_props_with_role(ui_props_with_thinking(value)),
+                            ui_props_with_role(ui_props_with_modalities(ui_props_with_thinking(value))),
                             cap_model.as_deref(),
                         ))
                         .into_response();
@@ -227,11 +248,11 @@ async fn ui_props(state: &Arc<AppState>, wanted: Option<String>) -> Response {
             .unwrap_or_else(|| "unknown".to_string())
     });
     Json(ui_props_with_ctx(
-        ui_props_with_role(ui_props_with_thinking(json!({
+        ui_props_with_role(ui_props_with_modalities(ui_props_with_thinking(json!({
             "model_path": model_path,
             "model_alias": null,
             "webui_version": "llm-router",
-        }))),
+        })))),
         cap_model.as_deref(),
     ))
     .into_response()
